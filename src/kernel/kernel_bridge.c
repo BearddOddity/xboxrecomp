@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -765,6 +766,35 @@ static void bridge_NtAllocateVirtualMemory(void)
         fflush(stderr);
     }
 
+    /* A caller that asks for a specific address above physical RAM (a real
+     * reservation, e.g. a title's own memory-pool subsystem carving out its
+     * own arena) needs that exact address honored or a clean failure -- the
+     * bump allocator below never tries to honor a hint, it just hands out
+     * wherever its cursor is, and silently substituting a different address
+     * breaks any caller that verifies what it got back against what it
+     * asked for. Route those through the dedicated extended-VMA tracker;
+     * everything else (base=0, or an address already inside mapped RAM)
+     * falls through to the existing heap-based path below unchanged. */
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = base_hint;
+        uint32_t vm_size = size;
+        uint32_t vm_status;
+        if (guest_vmem_allocate(&vm_base, &vm_size, alloc_type, protect, &vm_status)) {
+            if (KERNEL_LOG_ON()) {
+                fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory (extended VMA): "
+                                "base=0x%08X size=%u status=0x%08X\n",
+                        vm_base, vm_size, vm_status);
+                fflush(stderr);
+            }
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
+
     if (size == 0) {
         g_eax = 0xC0000045u; /* STATUS_INVALID_PAGE_PROTECTION */
         return;
@@ -941,6 +971,34 @@ static void bridge_NtQueryVirtualMemory(void)
         return;
     }
 
+    /* Anything the extended-VMA tracker owns (a real reservation/commit
+     * above RAM) has to be answered from its own bookkeeping -- the
+     * generic "everything above RAM is free" fallback below would
+     * misreport a page we've actually handed out as free, and a caller
+     * that walks its own address space checking for free ranges (exactly
+     * what this query exists to support) would then hand that "free"
+     * range straight back out again on top of a live allocation. */
+    {
+        uint32_t vm_info[7];
+        if (guest_vmem_query(base_va, vm_info)) {
+            BRIDGE_MEM32(info_va + 0x00) = vm_info[0]; /* BaseAddress */
+            BRIDGE_MEM32(info_va + 0x04) = vm_info[1]; /* AllocationBase */
+            BRIDGE_MEM32(info_va + 0x08) = vm_info[2]; /* AllocationProtect */
+            BRIDGE_MEM32(info_va + 0x0C) = vm_info[3]; /* RegionSize */
+            BRIDGE_MEM32(info_va + 0x10) = vm_info[4]; /* State */
+            BRIDGE_MEM32(info_va + 0x14) = vm_info[5]; /* Protect */
+            BRIDGE_MEM32(info_va + 0x18) = vm_info[6]; /* Type */
+            if (KERNEL_LOG_ON()) {
+                fprintf(stderr, "  [KERNEL] NtQueryVirtualMemory (extended VMA): "
+                                "base=0x%08X -> state=0x%X size=%u\n",
+                        base_va, vm_info[4], vm_info[3]);
+                fflush(stderr);
+            }
+            g_eax = 0;
+            return;
+        }
+    }
+
     BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
     BRIDGE_MEM32(info_va + 0x04) = page_base;          /* AllocationBase */
     BRIDGE_MEM32(info_va + 0x08) = 0x04;               /* PAGE_READWRITE */
@@ -951,7 +1009,15 @@ static void bridge_NtQueryVirtualMemory(void)
         BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
-        BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
+        /* Free region extends to the next committed boundary, not just one
+         * page. Reporting a single 4KB page here made every "find/enumerate
+         * free VM" loop crawl the whole free range one page at a time --
+         * on one title it never terminated, walking from the top of
+         * guest RAM to 0xFFFFFFFF, wrapping to 0, and doing it again, laps
+         * forever (see RtlCreateHeap-style probes noted above). */
+        uint32_t region_end = (page_base < g_xbox_code_lo) ? g_xbox_code_lo : 0xFFFFFFFFu;
+        uint32_t region_size = (page_base < region_end) ? (region_end - page_base) : 0x1000u;
+        BRIDGE_MEM32(info_va + 0x0C) = region_size ? region_size : 0x1000u;
         BRIDGE_MEM32(info_va + 0x10) = 0x10000;        /* MEM_FREE */
         BRIDGE_MEM32(info_va + 0x08) = 0;
         BRIDGE_MEM32(info_va + 0x18) = 0;
@@ -972,6 +1038,20 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+        uint32_t vm_status;
+        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
 
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
@@ -2430,6 +2510,9 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
     case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
     case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+    /* The CRT heap-grow path retries at a new address only on
+     * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
+    case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
 
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
