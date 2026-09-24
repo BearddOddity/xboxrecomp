@@ -255,6 +255,16 @@ static struct {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     Texture  tex;
+    /* Fixed-function transform: the composite matrix (world*view*projection
+     * *viewport, as D3D uploads it), the viewport offset added after the
+     * perspective divide, and which transform unit is active. */
+    uint32_t clip_raw_h, clip_raw_v;    /* SET_SURFACE_CLIP_* as sent */
+    float    aa_sx, aa_sy;              /* anti-aliasing scale of the surface */
+    float    composite[16];
+    float    vp_offset[4];
+    uint32_t xform_mode;                /* SET_TRANSFORM_EXECUTION_MODE */
+    int      composite_set;
+    uint32_t batches_ffp;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -405,6 +415,83 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     default:
         return 0;
     }
+}
+
+/* NV097 fixed-function transform methods (not in nv2a_regs.h's NV097 list). */
+#define NV097_SET_COMPOSITE_MATRIX_FIRST 0x0680
+#define NV097_SET_COMPOSITE_MATRIX_LAST  0x06BC
+#define NV097_SET_VIEWPORT_OFFSET_FIRST  0x0A20
+#define NV097_SET_VIEWPORT_OFFSET_LAST   0x0A2C
+#define NV097_SET_TRANSFORM_EXEC_MODE    0x1E94
+#define NV_XFORM_MODE_PROGRAM            2   /* low two bits; 0 = fixed */
+
+/* The surface rectangle in real pixels.
+ *
+ * SET_SURFACE_CLIP_* is in logical pixels; with anti-aliasing on, the surface
+ * is larger by the AA factor in SET_SURFACE_FORMAT bits 12-15 (0 = 1x1,
+ * 1 = 2x1 "center corner 2", 2 = 2x2 "square offset 4"), and so are the
+ * coordinates D3D's composite matrix produces. a title renders its
+ * 640x480 menu into a 1280x960 surface (pitch 5120), which read as an
+ * 8-bytes-per-pixel surface and drew nothing until this was applied. */
+static void surface_apply_clip(void)
+{
+    uint32_t aa = (s_gpu.format >> 12) & 0xF;
+    uint32_t sx = aa ? 2 : 1, sy = aa == 2 ? 2 : 1;
+
+    s_gpu.aa_sx = (float)sx;
+    s_gpu.aa_sy = (float)sy;
+
+    s_gpu.clip_x = (s_gpu.clip_raw_h & 0xFFFF) * sx;
+    s_gpu.clip_w = ((s_gpu.clip_raw_h >> 16) & 0xFFFF) * sx;
+    s_gpu.clip_y = (s_gpu.clip_raw_v & 0xFFFF) * sy;
+    s_gpu.clip_h = ((s_gpu.clip_raw_v >> 16) & 0xFFFF) * sy;
+}
+
+/* Is this batch transformed by the fixed-function unit? */
+static int batch_is_ffp(void)
+{
+    return s_gpu.composite_set
+        && (s_gpu.xform_mode & 3) != NV_XFORM_MODE_PROGRAM
+        && !s_gpu.inline_active;
+}
+
+/* Attribute 0 as a screen position.
+ *
+ * With the fixed-function unit active, attribute 0 is an object-space position
+ * and the hardware computes  clip[i] = sum_j M[4i+j] * pos[j]  with the 16
+ * floats in the order the methods deliver them (translation in M[3], M[7],
+ * M[11]; one title's menu matrix ends in the row 0 0 0 1), then
+ * screen = clip.xyz / clip.w + viewport offset. The composite matrix contains
+ * the viewport scale for the *logical* surface; with anti-aliasing the result
+ * is scaled up to the real surface (as xemu does). Otherwise attribute 0 is returned as-is
+ * (pre-transformed batches, and vertex programs, which are not run here).
+ *
+ * ponytail: no clipping. A triangle crossing w = 0 is dropped rather than
+ * clipped; title-screen quads never do. Add near-plane clipping with 3D scenes. */
+static int fetch_position(uint32_t index, float out[4])
+{
+    float in[4];
+    const float *m = s_gpu.composite;
+    float w;
+    int i;
+
+    if (!fetch_attr(&s_gpu.attr[0], index, in))
+        return 0;
+    if (!batch_is_ffp()) {
+        memcpy(out, in, sizeof in);
+        return 1;
+    }
+    for (i = 0; i < 4; i++)
+        out[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
+               + m[4 * i + 2] * in[2] + m[4 * i + 3];
+    w = out[3];
+    if (w <= 1e-6f)
+        return 0;
+    out[0] = (out[0] / w + s_gpu.vp_offset[0]) * s_gpu.aa_sx;
+    out[1] = (out[1] / w + s_gpu.vp_offset[1]) * s_gpu.aa_sy;
+    out[2] = out[2] / w + s_gpu.vp_offset[2];
+    out[3] = 1.0f / w;
+    return 1;
 }
 
 static uint32_t surface_bpp(void)
@@ -1108,12 +1195,12 @@ static int batch_is_screen_space(void)
 
     if (!s_gpu.clip_w || !s_gpu.clip_h || !s_gpu.idx_count)
         return 0;
-    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p))
+    if (!fetch_position(s_gpu.idx[0], p))
         return 0;
     lo_x = hi_x = p[0];
     lo_y = hi_y = p[1];
     for (i = 1; i < s_gpu.idx_count; i++) {
-        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
+        if (!fetch_position(s_gpu.idx[i], p))
             return 0;
         if (p[0] < lo_x) lo_x = p[0];
         if (p[0] > hi_x) hi_x = p[0];
@@ -1128,8 +1215,10 @@ static int batch_is_screen_space(void)
      || lo_y > (float)(s_gpu.clip_y + s_gpu.clip_h))
         return 0;
 
-    /* Small enough to be model units rather than pixels. */
-    if (hi_x - lo_x < OBJECT_SPACE_SPAN && hi_y - lo_y < OBJECT_SPACE_SPAN)
+    /* Small enough to be model units rather than pixels -- unless the
+     * fixed-function unit just turned them into pixels. */
+    if (!batch_is_ffp()
+     && hi_x - lo_x < OBJECT_SPACE_SPAN && hi_y - lo_y < OBJECT_SPACE_SPAN)
         return 0;
 
     return 1;
@@ -1159,9 +1248,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
     float p[3][4], uv[3][2];
     int textured;
 
-    if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
-     || !fetch_attr(&s_gpu.attr[0], i1, p[1])
-     || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
+    if (!fetch_position(i0, p[0])
+     || !fetch_position(i1, p[1])
+     || !fetch_position(i2, p[2]))
         return;
 
     textured = fetch_texcoord(i0, uv[0])
@@ -1182,6 +1271,32 @@ static void raster_batch(void)
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
+    }
+    if (batch_is_ffp()) {
+        s_gpu.batches_ffp++;
+        /* RECOMP_FFP_TRACE: the matrix and the first vertices of the first few
+         * fixed-function batches, raw and transformed -- the one view that
+         * tells a wrong matrix layout from wrong vertex data. */
+        if (getenv("RECOMP_FFP_TRACE") && s_gpu.batches_ffp <= 4) {
+            const float *m = s_gpu.composite;
+            float in[4], out[4];
+            uint32_t k;
+            fprintf(stderr, "  [FFP] batch %u prim %u n %u mode 0x%X vp_off %.2f %.2f %.2f"
+                            " clip %ux%u+%u+%u\n"
+                            "  [FFP]   M = %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                    s_gpu.batches_ffp, s_gpu.prim, s_gpu.idx_count, s_gpu.xform_mode,
+                    s_gpu.vp_offset[0], s_gpu.vp_offset[1], s_gpu.vp_offset[2],
+                    s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+            for (k = 0; k < s_gpu.idx_count && k < 4; k++) {
+                fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], in);
+                fetch_position(s_gpu.idx[k], out);
+                fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g %g)\n",
+                        s_gpu.idx[k], in[0], in[1], in[2], in[3],
+                        out[0], out[1], out[2], out[3]);
+            }
+        }
     }
 
     /* Count why, once per batch: the texture stage cannot change inside one. */
@@ -1572,15 +1687,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
-        s_gpu.clip_x = param & 0xFFFF;
-        s_gpu.clip_w = (param >> 16) & 0xFFFF;
+        s_gpu.clip_raw_h = param;
+        surface_apply_clip();
         break;
     case NV097_SET_SURFACE_CLIP_VERTICAL:
-        s_gpu.clip_y = param & 0xFFFF;
-        s_gpu.clip_h = (param >> 16) & 0xFFFF;
+        s_gpu.clip_raw_v = param;
+        surface_apply_clip();
         break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
+        surface_apply_clip();
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
@@ -1733,6 +1849,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     default:
+        if (method >= NV097_SET_COMPOSITE_MATRIX_FIRST
+         && method <= NV097_SET_COMPOSITE_MATRIX_LAST) {
+            memcpy(&s_gpu.composite[(method - NV097_SET_COMPOSITE_MATRIX_FIRST) / 4],
+                   &param, 4);
+            s_gpu.composite_set = 1;
+            break;
+        }
+        if (method >= NV097_SET_VIEWPORT_OFFSET_FIRST
+         && method <= NV097_SET_VIEWPORT_OFFSET_LAST) {
+            memcpy(&s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET_FIRST) / 4],
+                   &param, 4);
+            break;
+        }
+        if (method == NV097_SET_TRANSFORM_EXEC_MODE) {
+            s_gpu.xform_mode = param;
+            break;
+        }
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
@@ -1948,9 +2081,10 @@ void nv2a_pb_exec_report(void)
             dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
             dma_resolve(s_gpu.color_offset));
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
-                    " screen-space, %u triangles fully off-surface\n",
+                    " screen-space, %u triangles fully off-surface;"
+                    " %u batches via the fixed-function transform\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
-            s_gpu.tris_skipped_offscreen);
+            s_gpu.tris_skipped_offscreen, s_gpu.batches_ffp);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
