@@ -898,6 +898,10 @@ static void *g_kernel_memory = NULL;
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
+/* Set once xbox_MemoryLayoutInit successfully reserves real host memory
+ * for guest_vmem.c's extended-VMA range; see that reservation below. */
+int g_xbox_extvma_reserved = 0;
+
 /* Bounds of the title's executable sections, from its own XBE section table.
  *
  * RECOMP_ICALL uses these to decide whether an indirect-call target is code
@@ -2124,6 +2128,50 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
                 mirrors_ok, XBOX_NUM_MIRRORS,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+    }
+
+    /*
+     * Host backing for guest_vmem.c's extended-VMA tracker -- the range
+     * above the RAM-mirror scheme (aliased_top, exactly where the last
+     * mirror view above ends) up to the top of Xbox user address space
+     * (0x7FFE0000). guest_vmem.c reserves/commits guest requests up here
+     * for titles that ask NtAllocateVirtualMemory for a specific high
+     * address, but until now nothing ever gave that range real host
+     * memory -- confirmed live, a title's own allocation there succeeded
+     * at the bookkeeping level and then took a real access violation the
+     * first time it touched the memory, because g_xbox_mem_offset+guest_va
+     * pointed at host address space nobody had reserved.
+     *
+     * Reserve it here, right after the mirrors, for the same reason the
+     * mirrors themselves use an exact-address MapViewOfFileEx this early:
+     * this point in the process's life is when a fixed host address is
+     * most likely to still be free. Doing this lazily instead, the first
+     * time a title actually asks for extended VMA (which can be deep into
+     * boot, after the CRT heap, loaded DLLs, and other engine subsystems
+     * have already claimed nearby address space), measurably fails --
+     * that was the original, lazy version of this reservation, and it lost
+     * the exact address to something else nearly every run.
+     *
+     * MEM_RESERVE only: guest_vmem_allocate's own commit path
+     * (extvma_commit in guest_vmem.c) MEM_COMMITs the specific sub-ranges
+     * a title actually uses, exactly like real Xbox reserve-then-commit.
+     */
+    {
+        uint64_t aliased_top = (uint64_t)g_xbox_total_ram * (1u + XBOX_NUM_MIRRORS);
+        uint64_t extvma_size = (uint64_t)0x7FFE0000u - aliased_top;
+        void *extvma_base = (void *)((uintptr_t)g_memory_base + (uintptr_t)aliased_top);
+
+        if (VirtualAlloc(extvma_base, (SIZE_T)extvma_size, MEM_RESERVE, PAGE_NOACCESS)) {
+            g_xbox_extvma_reserved = 1;
+            fprintf(stderr, "  Extended VMA: reserved %llu MB at %p\n",
+                    (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base);
+        } else {
+            fprintf(stderr, "  Extended VMA: FAILED to reserve %llu MB at %p (error %lu) --"
+                            " a title reservation up here will get a clean failure"
+                            " instead of using this memory\n",
+                    (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base,
+                    GetLastError());
+        }
     }
 
     /*
