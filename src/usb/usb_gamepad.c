@@ -13,6 +13,8 @@
  */
 #include "usb_gamepad.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- descriptors ------------------------------------------------------- */
@@ -202,6 +204,123 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  *   4..11  analog buttons A B X Y Black White, then the two triggers
  *   12..19 four signed 16-bit stick axes, little endian
  */
+/* ---- scripted input ----------------------------------------------------- *
+ *
+ * RECOMP_INPUT_SCRIPT=<file> drives the pad from a timeline instead of (on top
+ * of) the host controller, so a title can be walked through its menus and into
+ * gameplay unattended -- for automated boot tests, and on machines with no pad.
+ *
+ * One event per line, times in milliseconds from the first report the title
+ * polls (i.e. from when its input stack is up):
+ *
+ *     <at_ms> <control> [hold_ms] [value]      # comment
+ *
+ * control: A B X Y BLACK WHITE LT RT (analog, value 0..255, default 255),
+ *          START BACK UP DOWN LEFT RIGHT LTHUMB RTHUMB (digital),
+ *          LX LY RX RY (stick, value -32768..32767).
+ * hold_ms defaults to 150. Example:  "20000 START"  "22000 A 150"  "30000 LY 2000 32767"
+ *
+ * ponytail: linear scan of at most 256 events per poll; fine for scripted
+ * walkthroughs, not meant as a recording/replay system.
+ */
+typedef struct {
+    uint32_t at, hold;
+    int      kind;          /* 0 digital, 1 analog button, 2 axis */
+    int      index;         /* bit mask, analog index, or axis 0..3 */
+    int      value;
+} ScriptEvent;
+
+static ScriptEvent s_script[256];
+static int         s_script_n = -1;     /* -1: not loaded yet */
+static uint64_t    s_script_t0;
+
+static int script_control(const char *name, ScriptEvent *e)
+{
+    static const struct { const char *n; int kind, index, value; } map[] = {
+        {"UP", 0, 0x0001, 0}, {"DOWN", 0, 0x0002, 0}, {"LEFT", 0, 0x0004, 0},
+        {"RIGHT", 0, 0x0008, 0}, {"START", 0, 0x0010, 0}, {"BACK", 0, 0x0020, 0},
+        {"LTHUMB", 0, 0x0040, 0}, {"RTHUMB", 0, 0x0080, 0},
+        {"A", 1, 0, 255}, {"B", 1, 1, 255}, {"X", 1, 2, 255}, {"Y", 1, 3, 255},
+        {"BLACK", 1, 4, 255}, {"WHITE", 1, 5, 255}, {"LT", 1, 6, 255}, {"RT", 1, 7, 255},
+        {"LX", 2, 0, 0}, {"LY", 2, 1, 0}, {"RX", 2, 2, 0}, {"RY", 2, 3, 0},
+    };
+    size_t i;
+    for (i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (!strcmp(name, map[i].n)) {
+            e->kind = map[i].kind;
+            e->index = map[i].index;
+            e->value = map[i].value;
+            return 1;
+        }
+    return 0;
+}
+
+static void script_load(void)
+{
+    const char *path = getenv("RECOMP_INPUT_SCRIPT");
+    char line[256], name[32];
+    FILE *f;
+
+    s_script_n = 0;
+    if (!path || !(f = fopen(path, "r")))
+        return;
+    while (s_script_n < (int)(sizeof s_script / sizeof s_script[0])
+           && fgets(line, sizeof line, f)) {
+        ScriptEvent e = {0};
+        unsigned at = 0, hold = 150;
+        int value = 0, n;
+        char *hash = strchr(line, '#');
+        if (hash)
+            *hash = 0;
+        n = sscanf(line, "%u %31s %u %d", &at, name, &hold, &value);
+        if (n < 2 || !script_control(name, &e)) {
+            if (n >= 2)
+                fprintf(stderr, "  [INPUT] script: unknown control '%s'\n", name);
+            continue;
+        }
+        e.at = at;
+        e.hold = n >= 3 ? hold : 150;
+        if (n >= 4)
+            e.value = value;
+        s_script[s_script_n++] = e;
+    }
+    fclose(f);
+    fprintf(stderr, "  [INPUT] script %s: %d events\n", path, s_script_n);
+    fflush(stderr);
+}
+
+/* Also called by game projects that replace XAPI input (XInputGetState)
+ * with host code, so scripted input works on either path. */
+void usb_gamepad_script_apply(XBOX_GAMEPAD *g)
+{
+    uint64_t now, t;
+    int i;
+
+    if (s_script_n < 0)
+        script_load();
+    if (!s_script_n)
+        return;
+    now = GetTickCount64();
+    if (!s_script_t0)
+        s_script_t0 = now;
+    t = now - s_script_t0;
+    for (i = 0; i < s_script_n; i++) {
+        const ScriptEvent *e = &s_script[i];
+        if (t < e->at || t >= (uint64_t)e->at + e->hold)
+            continue;
+        switch (e->kind) {
+        case 0: g->wButtons |= (WORD)e->index; break;
+        case 1: g->bAnalogButtons[e->index] = (BYTE)e->value; break;
+        case 2:
+            if (e->index == 0) g->sThumbLX = (SHORT)e->value;
+            if (e->index == 1) g->sThumbLY = (SHORT)e->value;
+            if (e->index == 2) g->sThumbRX = (SHORT)e->value;
+            if (e->index == 3) g->sThumbRY = (SHORT)e->value;
+            break;
+        }
+    }
+}
+
 int usb_gamepad_report(uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -217,7 +336,8 @@ int usb_gamepad_report(uint8_t *out, int max)
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
     if (xbox_InputGetState(0, &state) != 0)
-        return 20;
+        memset(&state, 0, sizeof state);
+    usb_gamepad_script_apply(&state.Gamepad);
 
     g = &state.Gamepad;
     out[2] = (uint8_t)(g->wButtons & 0xFF);

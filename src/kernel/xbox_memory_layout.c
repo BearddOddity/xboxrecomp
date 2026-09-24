@@ -2570,10 +2570,26 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * title allocates once. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE;
 
+/* Where the arena starts: just above the loaded image, not at the window base.
+ *
+ * The window is separate storage from low RAM, but its physical addresses
+ * (VA - 0x80000000) are the same numbers as low-RAM VAs, and
+ * MmGetPhysicalAddress passes non-contiguous VAs through unchanged. With the
+ * arena at physical 0, a DMA address below the image end was ambiguous: one title's
+ * USB stack hands the controller both contiguous descriptors
+ * (physical 0x006DC6A0) and a static .data buffer (VA 0x005DCE24), and no rule
+ * can tell those apart. Starting the arena above the image makes the two
+ * ranges disjoint: xbox_ContiguousIsPhysical() then answers exactly. */
+static uint32_t g_contig_start = XBOX_CONTIG_BASE;
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    if (g_contig_next == XBOX_CONTIG_BASE && g_xbox_image_hi) {
+        g_contig_start = XBOX_CONTIG_BASE + ((g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu);
+        g_contig_next = g_contig_start;
+    }
     if (alignment < 4096) alignment = 4096;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
@@ -2601,6 +2617,15 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* Does this physical (bus) address name memory the contiguous arena handed
+ * out? If so it is reached at XBOX_CONTIG_BASE + phys; otherwise it is a
+ * pass-through VA (see g_contig_start). */
+int xbox_ContiguousIsPhysical(uint32_t phys)
+{
+    return phys >= g_contig_start - XBOX_CONTIG_BASE
+        && phys <  g_contig_next  - XBOX_CONTIG_BASE;
 }
 
 

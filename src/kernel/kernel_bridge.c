@@ -1758,8 +1758,11 @@ static void bridge_AvSetDisplayMode(void)
          * directly lands in the loaded image instead, which is why the window
          * showed black while the executor was clearing and rasterising
          * correctly a few megabytes away. */
-        if (fb_va && fb_va < XBOX_CONTIG_SIZE)
-            fb_va = XBOX_CONTIG_BASE + fb_va;
+        {
+            extern int xbox_ContiguousIsPhysical(uint32_t phys);
+            if (fb_va && xbox_ContiguousIsPhysical(fb_va))
+                fb_va = XBOX_CONTIG_BASE + fb_va;
+        }
 
         xbox_FramebufferWindowSet(fb_va, pitch);
         xbox_FramebufferWindowStart();
@@ -2328,6 +2331,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         return 0;
     }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
+    fprintf(stderr, "  [KERNEL] timer thread on worker stack slice %d (top 0x%08X)\n",
+            slot, XBOX_WORKER_STACK_TOP(slot));
+    fflush(stderr);
     {
         /* Its own TIB, for the same reason bridge_thread_main gives one to
          * every worker: a DPC routine with an SEH prologue reads fs:[0],
