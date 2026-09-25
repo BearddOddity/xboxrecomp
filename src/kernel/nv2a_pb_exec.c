@@ -364,6 +364,15 @@ static void note_texture_use(void)
     }
 }
 
+/* The last value written to every Kelvin method, as the GPU's register file
+ * would hold it. State the executor does not model explicitly (lights,
+ * combiners, material colours) is read from here. */
+static uint32_t s_reg[0x2000 / 4];
+static float reg_f(uint32_t method) { float f; memcpy(&f, &s_reg[method / 4], 4); return f; }
+
+static uint32_t s_sem_va;
+void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+
 static void note_unhandled(uint32_t method, uint32_t param)
 {
     int i;
@@ -1525,6 +1534,82 @@ static int fetch_texcoord(uint32_t index, float out[2])
     return 1;
 }
 
+/* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).
+ *
+ * With lighting on, the diffuse colour the combiners see is computed per
+ * vertex from the normal and up to eight lights; the vertex's own colour
+ * stream is ignored unless SET_COLOR_MATERIAL routes it in. Using the colour
+ * stream anyway is what drew every lit mesh -- characters, streets -- black.
+ *
+ * XDK D3D pre-multiplies material into the light colours and folds
+ * emission + material ambient * global ambient into SCENE_AMBIENT_COLOR, so
+ * the hardware sum is simply
+ *   colour = scene_ambient + sum_i atten_i * (ambient_i + diffuse_i * max(0, N.L_i))
+ * with alpha from SET_MATERIAL_ALPHA. Everything is in eye space.
+ *
+ * ponytail: normals go through the model-view matrix itself rather than the
+ * inverse transpose (exact for rotations and uniform scale), no specular, no
+ * spot cones, no back-face colours, no skinning. Add them when a mesh looks
+ * wrong rather than dark. */
+#define NV_LIGHTS 8
+static int lit_color(uint32_t index, float out[4])
+{
+    const float *mv = (const float *)&s_reg[0x0480 / 4];
+    float pos[4], nrm[4], vc[4], e[3], n[3], len;
+    uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
+    int i, have_vc;
+
+    if (!s_reg[0x0314 / 4] || !s_gpu.attr[2].size)
+        return 0;
+    if (!fetch_attr(&s_gpu.attr[0], index, pos) || !fetch_attr(&s_gpu.attr[2], index, nrm))
+        return 0;
+    have_vc = fetch_attr(color_attr(), index, vc);
+
+    for (i = 0; i < 3; i++) {
+        e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1] + mv[4 * i + 2] * pos[2] + mv[4 * i + 3];
+        n[i] = mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1] + mv[4 * i + 2] * nrm[2];
+    }
+    len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+
+    out[0] = reg_f(0x0A10); out[1] = reg_f(0x0A14); out[2] = reg_f(0x0A18);
+    for (i = 0; i < NV_LIGHTS; i++) {
+        uint32_t kind = (mask >> (2 * i)) & 3, b = 0x1000 + (uint32_t)i * 0x80;
+        float l[3], att = 1.0f, ndl, amb[3], dif[3];
+        int k;
+
+        if (!kind)
+            continue;
+        if (kind == 1) {                                    /* infinite */
+            l[0] = reg_f(b + 0x34); l[1] = reg_f(b + 0x38); l[2] = reg_f(b + 0x3C);
+        } else {                                            /* local / spot */
+            float d;
+            l[0] = reg_f(b + 0x5C) - e[0]; l[1] = reg_f(b + 0x60) - e[1]; l[2] = reg_f(b + 0x64) - e[2];
+            d = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+            if (d > reg_f(b + 0x24) && reg_f(b + 0x24) > 0.0f)
+                continue;                                   /* out of range */
+            if (d > 1e-8f) { l[0] /= d; l[1] /= d; l[2] /= d; }
+            att = reg_f(b + 0x68) + reg_f(b + 0x6C) * d + reg_f(b + 0x70) * d * d;
+            att = att > 1e-8f ? 1.0f / att : 1.0f;
+        }
+        ndl = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
+        if (ndl < 0.0f) ndl = 0.0f;
+        for (k = 0; k < 3; k++) {
+            amb[k] = reg_f(b + 0x00 + 4 * k);
+            dif[k] = reg_f(b + 0x0C + 4 * k);
+            /* COLOR_MATERIAL: 1 in the ambient (bits 2-3) or diffuse (bits
+             * 4-5) field takes that material colour from the vertex. */
+            if (have_vc && ((colmat >> 2) & 3) == 1) amb[k] *= vc[k];
+            if (have_vc && ((colmat >> 4) & 3) == 1) dif[k] *= vc[k];
+            out[k] += att * (amb[k] + dif[k] * ndl);
+        }
+    }
+    out[3] = (have_vc && ((colmat >> 4) & 3) == 1) ? vc[3] : reg_f(0x03B4);
+    for (i = 0; i < 4; i++)
+        out[i] = out[i] < 0.0f ? 0.0f : out[i] > 1.0f ? 1.0f : out[i];
+    return 1;
+}
+
 static uint32_t vertex_color(uint32_t index)
 {
     float c[4];
@@ -1534,7 +1619,7 @@ static uint32_t vertex_color(uint32_t index)
         memcpy(c, vp_vertex(index)->d0, sizeof c);
         for (i = 0; i < 4; i++)
             c[i] = c[i] < 0.0f ? 0.0f : c[i] > 1.0f ? 1.0f : c[i];
-    } else if (!fetch_attr(color_attr(), index, c))
+    } else if (!lit_color(index, c) && !fetch_attr(color_attr(), index, c))
         return 0xFFFFFFFFu;
     return ((uint32_t)(c[3] * 255.0f) << 24)
          | ((uint32_t)(c[0] * 255.0f) << 16)
@@ -1889,6 +1974,36 @@ static void draw_primitive(void)
         if (s_gpu.flips >= (uint32_t)from && shown++ < (from ? 3000 : 6)) {
             fprintf(stderr, "  [GPU] --- batch at flip %u, xform mode %u, tex fmt 0x%08X addr %u/%u\n",
                     s_gpu.flips, s_gpu.xform_mode, s_tex_reg[1], s_gpu.tex.addr_u, s_gpu.tex.addr_v);
+            fprintf(stderr, "  [GPU]   light en %u mask 0x%X colmat 0x%X ctl 0x%X ambient %g %g %g"
+                            " | comb ctl 0x%X c0 icw 0x%08X ocw 0x%08X a0 icw 0x%08X f0 0x%08X"
+                            " fin 0x%08X/0x%08X | tex1 0x%08X ctl0 0x%08X | diffuse0 0x%08X attr2 %u\n",
+                    s_reg[0x0314/4], s_reg[0x03BC/4], s_reg[0x0298/4], s_reg[0x0294/4],
+                    reg_f(0x0A10), reg_f(0x0A14), reg_f(0x0A18),
+                    s_reg[0x1E60/4], s_reg[0x0AC0/4], s_reg[0x1E40/4], s_reg[0x0260/4], s_reg[0x0A60/4],
+                    s_reg[0x0288/4], s_reg[0x028C/4], s_reg[0x1B44/4], s_reg[0x1B4C/4],
+                    s_gpu.idx_count ? vertex_color(s_gpu.idx[0]) : 0, s_gpu.attr[2].size);
+            if (s_reg[0x0314 / 4]) {
+                uint32_t li;
+                float lc[4] = {0};
+                for (li = 0; li < 6; li++) {
+                    uint32_t b = 0x1000 + li * 0x80;
+                    fprintf(stderr, "  [GPU]   light%u amb %g %g %g dif %g %g %g dir %g %g %g pos %g %g %g att %g %g %g\n",
+                            li, reg_f(b), reg_f(b + 4), reg_f(b + 8),
+                            reg_f(b + 0xC), reg_f(b + 0x10), reg_f(b + 0x14),
+                            reg_f(b + 0x34), reg_f(b + 0x38), reg_f(b + 0x3C),
+                            reg_f(b + 0x5C), reg_f(b + 0x60), reg_f(b + 0x64),
+                            reg_f(b + 0x68), reg_f(b + 0x6C), reg_f(b + 0x70));
+                }
+                if (s_gpu.idx_count && lit_color(s_gpu.idx[0], lc))
+                    fprintf(stderr, "  [GPU]   lit v0 = %g %g %g %g  mat alpha %g emis %g %g %g\n",
+                            lc[0], lc[1], lc[2], lc[3], reg_f(0x03B4),
+                            reg_f(0x03A8), reg_f(0x03AC), reg_f(0x03B0));
+            }
+            fprintf(stderr, "  [GPU]   blend %u %X/%X eq %X | depth %u func %X write %u | atest %u %X ref %u | cull %u\n",
+                    s_gpu.rs.blend_enable, s_gpu.rs.blend_src, s_gpu.rs.blend_dst, s_gpu.rs.blend_eq,
+                    s_gpu.rs.depth_test_enable, s_gpu.rs.depth_func, s_gpu.rs.depth_write,
+                    s_gpu.rs.alpha_test_enable, s_gpu.rs.alpha_func, s_gpu.rs.alpha_ref,
+                    s_gpu.rs.cull_enable);
             if (batch_is_vp()) {
                 static int prog_shown;
                 uint32_t pc;
@@ -2215,6 +2330,13 @@ static int capture_render_state(uint32_t method, uint32_t param)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+
+    s_reg[(method & 0x1FFCu) / 4] = param;
+    if (method == 0x1D70 && s_sem_va) {     /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        *(volatile uint32_t *)(mem + s_sem_va + s_reg[0x1D6C / 4]) = param;
+        return;
+    }
     if (!inited) {
         inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;

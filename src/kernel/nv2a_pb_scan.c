@@ -166,18 +166,58 @@ void nv2a_pb_scan_report(void)
 #define PB_RAM_BYTES (64u * 1024u * 1024u)   /* XBOX_CONTIG_SIZE */
 
 /* A jump or call outside RAM means the walk is reading data as commands. */
+/* The last command headers decoded, so a desync can be traced back to the
+ * command that caused it. */
+#define PB_HIST 8
+static struct { uint32_t at, w; } s_hist[PB_HIST];
+static unsigned s_hist_n;
+/* The last jumps/calls/returns taken, and resyncs (w = 0xFFFFFFFF). */
+static struct { uint32_t at, w, to; } s_flow[PB_HIST];
+static unsigned s_flow_n;
+static void pb_flow(uint32_t at, uint32_t w, uint32_t to)
+{
+    s_flow[s_flow_n % PB_HIST].at = at;
+    s_flow[s_flow_n % PB_HIST].w = w;
+    s_flow[s_flow_n % PB_HIST].to = to;
+    s_flow_n++;
+}
+
 static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
 {
-    static int shown;
+    static unsigned total;
+    unsigned k;
     if (target < PB_RAM_BYTES)
         return 0;
-    if (shown++ < 16)
-        fprintf(stderr, "  [PB] bad target 0x%08X from word 0x%08X at 0x%08X"
-                        " (PUT 0x%08X); resync\n", target, w, at, put);
+    if (++total <= 16 || total % 100 == 0) {
+        fprintf(stderr, "  [PB] bad target #%u 0x%08X from word 0x%08X at 0x%08X"
+                        " (PUT 0x%08X); resync\n", total, target, w, at, put);
+        if (total <= 4)
+            for (k = 0; k < PB_HIST && k < s_hist_n; k++) {
+                unsigned i = (s_hist_n - 1 - k) % PB_HIST;
+                fprintf(stderr, "  [PB]   earlier header 0x%08X at 0x%08X\n",
+                        s_hist[i].w, s_hist[i].at);
+            }
+        if (total <= 4)
+            for (k = 0; k < PB_HIST && k < s_flow_n; k++) {
+                unsigned i = (s_flow_n - 1 - k) % PB_HIST;
+                fprintf(stderr, "  [PB]   earlier flow 0x%08X at 0x%08X -> 0x%08X\n",
+                        s_flow[i].w, s_flow[i].at, s_flow[i].to);
+            }
+    }
     return 1;
 }
 static uint32_t s_get = 0xFFFFFFFFu, s_ret;
 static int      s_in_call;
+
+/* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
+ * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
+ * position would read whatever lies between as commands. */
+void nv2a_pb_resync(uint32_t get_phys)
+{
+    pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
+    s_get = get_phys & PB_PHYS_MASK;
+    s_in_call = 0;
+}
 
 void nv2a_pb_scan(uint32_t put_phys)
 {
@@ -189,7 +229,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")))
         return;
-    if (s_get == 0xFFFFFFFFu) {               /* first PUT: start from here */
+    if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put;
         return;
     }
@@ -203,6 +243,9 @@ void nv2a_pb_scan(uint32_t put_phys)
             break;
         }
         w = *(const uint32_t *)(mem + (0x80000000u | s_get));
+        s_hist[s_hist_n % PB_HIST].at = at;
+        s_hist[s_hist_n % PB_HIST].w = w;
+        s_hist_n++;
 
         if (++words > 0x400000u || unknown > 64) {
             s_get = put;                      /* lost sync, or runaway */
@@ -213,6 +256,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
             target = w & 0x1FFFFFFCu;
             if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            pb_flow(at, w, target);
             s_get = target;
             jumps++;
             continue;
@@ -220,6 +264,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         if ((w & 3u) == 1u) {                            /* jump */
             target = w & 0xFFFFFFFCu;
             if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            pb_flow(at, w, target);
             s_get = target;
             jumps++;
             continue;
@@ -229,11 +274,13 @@ void nv2a_pb_scan(uint32_t put_phys)
             if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
             s_ret = s_get;
             s_in_call = 1;
+            pb_flow(at, w, target);
             s_get = target;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {          /* return */
             if (s_in_call) {
+                pb_flow(at, w, s_ret);
                 s_get = s_ret;
                 s_in_call = 0;
             }
