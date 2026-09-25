@@ -243,6 +243,8 @@ static struct {
      * that has not been drawn yet -- which is how a correctly rendered
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
+    uint32_t drawn_pitch;
+    int      flip_seen;      /* once flips arrive, the window follows them */
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
@@ -684,7 +686,8 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    if (!s_gpu.flip_seen)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -1072,6 +1075,7 @@ static void raster_triangle(const float a[2], const float b[2],
     }
     s_gpu.tris_drawn++;
     s_gpu.drawn_offset = s_gpu.color_offset;
+    s_gpu.drawn_pitch = s_gpu.pitch;
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -1801,6 +1805,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* Show the frame just finished: the surface the last batch drew
+         * into. Following clears instead showed whatever offscreen target
+         * was cleared last -- X-Men Legends' font/icon atlas. */
+        if (s_gpu.drawn_offset) {
+            s_gpu.flip_seen = 1;
+            xbox_FramebufferWindowSet(dma_resolve(s_gpu.drawn_offset),
+                                      s_gpu.drawn_pitch);
+        }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
