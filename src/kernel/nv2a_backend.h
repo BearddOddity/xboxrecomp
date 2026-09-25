@@ -90,4 +90,14 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
 
+/* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
+ * of the semaphore the title reads GPU progress from (for XDK D3D, the
+ * pointer at device+0x30). The executor writes each release there, plus
+ * SET_SEMAPHORE_OFFSET, once it has executed everything before it -- which is
+ * what lets D3D's fence waits and ring-space checks see real progress.
+ *
+ * ponytail: the title supplies the address instead of the executor resolving
+ * the semaphore context DMA object through RAMIN. */
+void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+
 #endif /* NV2A_BACKEND_H */

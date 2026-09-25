@@ -928,6 +928,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * is being drawn and the missing piece is upstream of the GPU. */
             static DWORD  last_put_ms;
             static uint32_t last_put;
+            static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
@@ -951,6 +952,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
+                    extern void nv2a_pb_resync(uint32_t);
+                    uint32_t get_now = *(volatile uint32_t *)
+                                       ((char *)regs + NV2A_USER_DMA_GET);
+                    /* GET is ours to advance; if it is not what we last
+                     * wrote, the title reset the ring. The first time, it is
+                     * where D3D started the ring: walking from there rather
+                     * than from the first PUT keeps the one-time device state
+                     * (depth function, and so on) sent before it. */
+                    if (get_written == 0xFFFFFFFFu || get_now != get_written)
+                        nv2a_pb_resync(get_now);
                     if (put != last_put)
                         nv2a_pb_scan(put);
                     /* Periodic, because what the title submits at init is not
@@ -967,6 +978,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
                     *get = put;
+                    get_written = put;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
