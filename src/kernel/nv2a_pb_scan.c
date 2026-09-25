@@ -144,48 +144,120 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Walk the pushbuffer the way the GPU's DMA engine does, from our own read
+ * position up to the title's DMA_PUT.
+ *
+ * This used to scan only the bytes between the previous PUT and this one,
+ * stop at the first jump, skip subroutine calls, and skip the whole segment
+ * whenever PUT wrapped back to the start of the ring. Each of those drops
+ * commands: XDK D3D sends state and vertex-program uploads through CALLs into
+ * pre-built pushbuffers, and every wrap lost a segment. What survived drew
+ * with stale state -- untransformed meshes run through the pre-transformed
+ * pass-through program, garbled text.
+ *
+ * So: keep a GET of our own (physical, like the register), follow JUMP and
+ * CALL/RETURN (NV2A has one level of subroutine), and stop when GET reaches
+ * PUT. Addresses are physical; the contiguous window at XBOX_CONTIG_BASE is
+ * the physical view.
+ *
+ * ponytail: if the walk desynchronises (a run of words that decode as
+ * nothing), GET snaps to PUT rather than wandering through guest RAM. */
+#define PB_PHYS_MASK 0x0FFFFFFCu
+#define PB_RAM_BYTES (64u * 1024u * 1024u)   /* XBOX_CONTIG_SIZE */
+
+/* A jump or call outside RAM means the walk is reading data as commands. */
+static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
+{
+    static int shown;
+    if (target < PB_RAM_BYTES)
+        return 0;
+    if (shown++ < 16)
+        fprintf(stderr, "  [PB] bad target 0x%08X from word 0x%08X at 0x%08X"
+                        " (PUT 0x%08X); resync\n", target, w, at, put);
+    return 1;
+}
+static uint32_t s_get = 0xFFFFFFFFu, s_ret;
+static int      s_in_call;
+
+void nv2a_pb_scan(uint32_t put_phys)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
+    uint32_t put = put_phys & PB_PHYS_MASK;
     uint32_t words = 0, jumps = 0, unknown = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")) || end_va <= start_va)
+    if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")))
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
+    if (s_get == 0xFFFFFFFFu) {               /* first PUT: start from here */
+        s_get = put;
+        return;
+    }
 
-    while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
-        va += 4;
-        words++;
+    while (s_get != put) {
+        uint32_t at = s_get, target;
+        uint32_t w;
 
-        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            jumps++;
-            break;                            /* a jump ends this segment */
+        if (s_get >= PB_RAM_BYTES) {
+            s_get = put;
+            break;
         }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+        w = *(const uint32_t *)(mem + (0x80000000u | s_get));
+
+        if (++words > 0x400000u || unknown > 64) {
+            s_get = put;                      /* lost sync, or runaway */
+            break;
+        }
+        s_get = (s_get + 4) & PB_PHYS_MASK;
+
+        if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
+            target = w & 0x1FFFFFFCu;
+            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            s_get = target;
+            jumps++;
             continue;
+        }
+        if ((w & 3u) == 1u) {                            /* jump */
+            target = w & 0xFFFFFFFCu;
+            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            s_get = target;
+            jumps++;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                            /* call */
+            target = w & 0xFFFFFFFCu;
+            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            s_ret = s_get;
+            s_in_call = 1;
+            s_get = target;
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {          /* return */
+            if (s_in_call) {
+                s_get = s_ret;
+                s_in_call = 0;
+            }
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && s_get < PB_RAM_BYTES; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
+                uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
                 note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
                 if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
-                va += 4;
+                    nv2a_pb_exec_method(subch, m, param);
+                s_get = (s_get + 4) & PB_PHYS_MASK;
                 words++;
             }
+            unknown = 0;
             continue;
         }
         unknown++;
