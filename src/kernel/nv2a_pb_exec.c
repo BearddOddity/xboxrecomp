@@ -1599,12 +1599,16 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+/* NV097 primitive types that are triangles under some winding
+ * (NV097_SET_BEGIN_END_OP_* in nv2a_regs.h; 0 is END, 1-4 points and lines).
+ * These were one lower, which drew every triangle strip as a fan and every
+ * triangle list as a strip: 3D meshes smeared into long spikes. */
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* The batch as a triangle list of vertex indices, `emit` called per triangle.
  *
@@ -1633,6 +1637,7 @@ static void for_each_triangle(void (*emit)(uint32_t, uint32_t, uint32_t, void *)
         }
         break;
     case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:                   /* convex: a fan */
         for (i = 1; i + 1 < n; i++)
             emit(x[0], x[i], x[i + 1], ctx);
         break;
@@ -1884,6 +1889,26 @@ static void draw_primitive(void)
         if (s_gpu.flips >= (uint32_t)from && shown++ < (from ? 3000 : 6)) {
             fprintf(stderr, "  [GPU] --- batch at flip %u, xform mode %u, tex fmt 0x%08X addr %u/%u\n",
                     s_gpu.flips, s_gpu.xform_mode, s_tex_reg[1], s_gpu.tex.addr_u, s_gpu.tex.addr_v);
+            if (batch_is_vp()) {
+                static int prog_shown;
+                uint32_t pc;
+                if (!prog_shown++) {
+                    fprintf(stderr, "  [VP] start %u load %u const_load %u\n",
+                            s_vp.prog_start, s_vp.prog_load, s_vp.const_load);
+                    for (pc = s_vp.prog_start; pc < VP_SLOTS && pc < s_vp.prog_start + 40; pc++) {
+                        fprintf(stderr, "  [VP] %3u: %08X %08X %08X %08X\n", pc,
+                                s_vp.prog[pc][0], s_vp.prog[pc][1],
+                                s_vp.prog[pc][2], s_vp.prog[pc][3]);
+                        if (s_vp.prog[pc][3] & 1)
+                            break;
+                    }
+                    for (pc = 0; pc < VP_CONSTS; pc++)
+                        if (s_vp.c[pc][0] != 0.0f || s_vp.c[pc][1] != 0.0f
+                         || s_vp.c[pc][2] != 0.0f || s_vp.c[pc][3] != 0.0f)
+                            fprintf(stderr, "  [VP] c%-3u %g %g %g %g\n", pc,
+                                    s_vp.c[pc][0], s_vp.c[pc][1], s_vp.c[pc][2], s_vp.c[pc][3]);
+                }
+            }
             {
                 uint32_t k;
                 float sp[4];
