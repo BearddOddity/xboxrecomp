@@ -262,6 +262,8 @@ static struct {
      * *viewport, as D3D uploads it), the viewport offset added after the
      * perspective divide, and which transform unit is active. */
     uint32_t clip_raw_h, clip_raw_v;    /* SET_SURFACE_CLIP_* as sent */
+    Nv2aRenderState rs;                 /* handed to a back end with each batch */
+    uint32_t zstencil_clear;            /* SET_ZSTENCIL_CLEAR_VALUE */
     float    aa_sx, aa_sy;              /* anti-aliasing scale of the surface */
     float    composite[16];
     float    vp_offset[4];
@@ -643,17 +645,22 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
+    /* A back end clears colour and/or depth/stencil itself (flags are the
+     * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
+    if (s_backend && s_backend->clear) {
+        Nv2aSurface surf;
+        if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
+            return;
+        current_surface(&surf);
+        s_backend->clear(&surf, &s_gpu.rs, param, s_gpu.clear_color,
+                         s_gpu.zstencil_clear);
+        s_gpu.clears++;
+        return;
+    }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
-    if (s_backend && s_backend->clear) {
-        Nv2aSurface surf;
-        current_surface(&surf);
-        s_backend->clear(&surf, s_gpu.clear_color, 0, 0, surf.width, surf.height);
-        s_gpu.clears++;
-        return;
-    }
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
@@ -1391,6 +1398,7 @@ static void backend_batch(void)
     batch.vertices = s_bverts;
     batch.count = n;
     batch.texture = NULL;
+    batch.state = &s_gpu.rs;
     {
         const VertexAttr *tc = texcoord_attr();
         if (s_gpu.tex.valid && tc->offset && tc->stride) {
@@ -1807,6 +1815,36 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* Render state for a back end (nv2a_backend.h). Returns 1 if consumed. */
+static int capture_render_state(uint32_t method, uint32_t param)
+{
+    Nv2aRenderState *r = &s_gpu.rs;
+    float f;
+
+    switch (method) {
+    case 0x0300: r->alpha_test_enable = param; return 1; /* SET_ALPHA_TEST_ENABLE */
+    case 0x0304: r->blend_enable      = param; return 1; /* SET_BLEND_ENABLE */
+    case 0x0308: r->cull_enable       = param; return 1; /* SET_CULL_FACE_ENABLE */
+    case 0x030C: r->depth_test_enable = param; return 1; /* SET_DEPTH_TEST_ENABLE */
+    case 0x033C: r->alpha_func        = param; return 1; /* SET_ALPHA_FUNC */
+    case 0x0340: r->alpha_ref         = param; return 1; /* SET_ALPHA_REF */
+    case 0x0344: r->blend_src         = param; return 1; /* SET_BLEND_FUNC_SFACTOR */
+    case 0x0348: r->blend_dst         = param; return 1; /* SET_BLEND_FUNC_DFACTOR */
+    case 0x034C: r->blend_color       = param; return 1; /* SET_BLEND_COLOR */
+    case 0x0350: r->blend_eq          = param; return 1; /* SET_BLEND_EQUATION */
+    case 0x0354: r->depth_func        = param; return 1; /* SET_DEPTH_FUNC */
+    case 0x0358: r->color_mask        = param; return 1; /* SET_COLOR_MASK */
+    case 0x035C: r->depth_write       = param; return 1; /* SET_DEPTH_MASK */
+    case 0x039C: r->cull_face         = param; return 1; /* SET_CULL_FACE */
+    case 0x03A0: r->front_face        = param; return 1; /* SET_FRONT_FACE */
+    case 0x0394: memcpy(&f, &param, 4); r->depth_min = f; return 1; /* SET_CLIP_MIN */
+    case 0x0398: memcpy(&f, &param, 4); r->depth_max = f; return 1; /* SET_CLIP_MAX */
+    case 0x0214: r->zeta_va = param ? dma_resolve(param) : 0; return 1; /* ZETA_OFFSET */
+    case 0x1D8C: s_gpu.zstencil_clear = param; return 1;  /* SET_ZSTENCIL_CLEAR_VALUE */
+    default:     return 0;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -2014,6 +2052,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     default:
+        if (capture_render_state(method, param))
+            break;
         if (method >= NV097_SET_COMPOSITE_MATRIX_FIRST
          && method <= NV097_SET_COMPOSITE_MATRIX_LAST) {
             memcpy(&s_gpu.composite[(method - NV097_SET_COMPOSITE_MATRIX_FIRST) / 4],
