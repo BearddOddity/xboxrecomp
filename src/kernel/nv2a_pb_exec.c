@@ -283,7 +283,7 @@ static struct {
     uint32_t xform_mode;                /* SET_TRANSFORM_EXECUTION_MODE */
     int      composite_set;
     uint32_t batches_ffp;
-} s_gpu;
+} s_gpu = { .rs.color_mask = 0x01010101u };   /* NV2A reset: all channels written */
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -393,6 +393,8 @@ static void note_unhandled(uint32_t method, uint32_t param)
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
         *slot = (uint16_t)s_unhandled_count;
+        if (getenv("RECOMP_PB_UNHANDLED_FIRST"))   /* first sight of each method */
+            fprintf(stderr, "[PB] first unhandled method 0x%04X param 0x%08X\n", method, param);
     }
 }
 
@@ -1877,6 +1879,20 @@ static void backend_batch(void)
     for_each_triangle(backend_tri, &n);
     if (!n)
         return;
+
+    if (getenv("RECOMP_DBG_EYE") && n >= 1500) {   /* camera of big (level) draws */
+        static DWORD next_eye;
+        if (GetTickCount() > next_eye) {
+            const float *mv = (const float *)&s_reg[0x0480 / 4];
+            float eye[3];
+            int j;
+            next_eye = GetTickCount() + 250;
+            for (j = 0; j < 3; j++)             /* -R^T t: the eye in object space */
+                eye[j] = -(mv[j] * mv[3] + mv[4 + j] * mv[7] + mv[8 + j] * mv[11]);
+            fprintf(stderr, "[EYE] %u verts eye %.1f %.1f %.1f fwd %.3f %.3f %.3f\n",
+                    n, eye[0], eye[1], eye[2], mv[8], mv[9], mv[10]);
+        }
+    }
 
     if (getenv("RECOMP_DBG_CULL")) {    /* per second: path x cull state */
         static struct { uint32_t key, n; } seen[16];
