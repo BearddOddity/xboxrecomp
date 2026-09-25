@@ -51,15 +51,32 @@ typedef struct {
     float    u, v;              /* texels */
 } Nv2aVertex;
 
+/* Render state as the title set it, in NV2A's own (OpenGL) enum values:
+ * blend factors GL_ZERO/GL_ONE/0x300..0x308/0x8001..0x8004, equations
+ * GL_FUNC_ADD 0x8006 etc., compare functions GL_NEVER 0x200 .. GL_ALWAYS 0x207.
+ * color_mask uses NV2A's bytes: A 0x01000000, R 0x00010000, G 0x100, B 0x1. */
+typedef struct {
+    uint32_t blend_enable, blend_src, blend_dst, blend_eq, blend_color;
+    uint32_t alpha_test_enable, alpha_func, alpha_ref;   /* ref 0..255 */
+    uint32_t depth_test_enable, depth_func, depth_write;
+    uint32_t color_mask;
+    uint32_t cull_enable, cull_face, front_face;
+    uint32_t zeta_va;                                    /* 0: no depth surface */
+    float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
+} Nv2aRenderState;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
+    const Nv2aRenderState *state;
 } Nv2aBatch;
 
 typedef struct {
-    void (*clear)(const Nv2aSurface *s, uint32_t argb,
-                  uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
+     * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+    void (*clear)(const Nv2aSurface *s, const Nv2aRenderState *rs,
+                  uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
 } Nv2aBackend;
