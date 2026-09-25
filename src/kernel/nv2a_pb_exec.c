@@ -1829,6 +1829,8 @@ static int backend_vertex(uint32_t index, Nv2aVertex *out)
  * roughly thirds the executor's per-vertex work. Direct-mapped on the low 16
  * bits of the index, tagged with the full index and the batch generation.
  * ponytail: indices 64K apart that collide just recompute. */
+static struct { uint32_t batches, dark_lit; } s_vit;
+
 #define NV_VCACHE 65536
 typedef struct { uint32_t gen, index; int ok; Nv2aVertex v; } VCacheEntry;
 static VCacheEntry s_vcache[NV_VCACHE];
@@ -1896,6 +1898,23 @@ static void backend_batch(void)
     }
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += n / 3;
+    s_vit.batches++;
+    /* A lit batch whose first vertex came out near black: the signature of a
+     * lighting bug (normals, light setup) rather than a dark scene, when it
+     * climbs suddenly. */
+    if (s_reg[0x0314 / 4] && (s_bverts[0].diffuse & 0x00F8F8F8u) == 0)
+        s_vit.dark_lit++;
+}
+
+/* Renderer totals for a title's vitals monitor: out[] = batches drawn,
+ * batches skipped as untransformed, lit batches that came out black,
+ * triangles drawn. Monotonic; the caller takes differences. */
+void nv2a_pb_exec_get_stats(uint32_t out[4])
+{
+    out[0] = s_vit.batches;
+    out[1] = s_gpu.batches_untransformed;
+    out[2] = s_vit.dark_lit;
+    out[3] = s_gpu.tris_drawn;
 }
 
 static void raster_batch(void)

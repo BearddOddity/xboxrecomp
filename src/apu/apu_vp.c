@@ -1169,10 +1169,25 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* For a vitals monitor: the most voices active in one frame, and the loudest
+ * mix-bin sample (0..1) the voice processor produced, both since the last
+ * call. Silence with voices active means the voices render nothing;
+ * silence with none means the game started none. */
+static int   g_vp_voices_now, g_vp_voices_max;
+static float g_vp_mix_peak;
+void apu_vp_get_stats(int *voices, float *mix_peak)
+{
+    *voices = g_vp_voices_max;
+    *mix_peak = g_vp_mix_peak;
+    g_vp_voices_max = 0;
+    g_vp_mix_peak = 0.0f;
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    g_vp_voices_now = 0;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1198,10 +1213,18 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                g_vp_voices_now++;
             }
             d->regs[current] = d->regs[next];
         }
     }
+    if (g_vp_voices_now > g_vp_voices_max)
+        g_vp_voices_max = g_vp_voices_now;
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
+            float a = fabsf(mixbins[b][s]);
+            if (a > g_vp_mix_peak) g_vp_mix_peak = a;
+        }
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

@@ -744,6 +744,10 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Pushbuffer executor load over the last second, in percent. */
+static int s_exec_busy_pct;
+int nv2a_exec_busy_percent(void) { return s_exec_busy_pct; }
+
 static void nv2a_ack_flags(volatile uint32_t *regs)
 {
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -863,8 +867,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     if (get_written == 0xFFFFFFFFu || get_now != get_written)
                         nv2a_pb_resync(get_now);
                     if (put != last_put) {
-                        /* Executor load, logged every 5 s: the share of wall
-                         * time spent executing pushbuffer commands. Near 100%
+                        /* Executor load over the last second (see
+                         * nv2a_exec_busy_percent): the share of wall time
+                         * spent executing pushbuffer commands. Near 100%
                          * means the "GPU" is the frame-rate limit. */
                         static LARGE_INTEGER f, t_last;
                         static LONGLONG busy;
@@ -874,9 +879,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan(put);
                         QueryPerformanceCounter(&b);
                         busy += b.QuadPart - a.QuadPart;
-                        if (b.QuadPart - t_last.QuadPart > 5 * f.QuadPart) {
-                            fprintf(stderr, "[PB] executor busy %.0f%%\n",
-                                    100.0 * busy / (double)(b.QuadPart - t_last.QuadPart));
+                        if (b.QuadPart - t_last.QuadPart > f.QuadPart) {
+                            s_exec_busy_pct = (int)(100.0 * busy / (double)(b.QuadPart - t_last.QuadPart));
                             busy = 0;
                             t_last = b;
                         }
