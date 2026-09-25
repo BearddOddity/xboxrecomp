@@ -1994,6 +1994,19 @@ static void draw_primitive(void)
                             reg_f(b + 0x5C), reg_f(b + 0x60), reg_f(b + 0x64),
                             reg_f(b + 0x68), reg_f(b + 0x6C), reg_f(b + 0x70));
                 }
+                {
+                    const float *mv = (const float *)&s_reg[0x0480 / 4];
+                    const float *im = (const float *)&s_reg[0x0580 / 4];
+                    float nn[4];
+                    fprintf(stderr, "  [GPU]   MV %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                            mv[0], mv[1], mv[2], mv[3], mv[4], mv[5], mv[6], mv[7],
+                            mv[8], mv[9], mv[10], mv[11], mv[12], mv[13], mv[14], mv[15]);
+                    fprintf(stderr, "  [GPU]   IMV %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                            im[0], im[1], im[2], im[3], im[4], im[5], im[6], im[7],
+                            im[8], im[9], im[10], im[11], im[12], im[13], im[14], im[15]);
+                    if (s_gpu.idx_count && fetch_attr(&s_gpu.attr[2], s_gpu.idx[0], nn))
+                        fprintf(stderr, "  [GPU]   normal v0 %g %g %g\n", nn[0], nn[1], nn[2]);
+                }
                 if (s_gpu.idx_count && lit_color(s_gpu.idx[0], lc))
                     fprintf(stderr, "  [GPU]   lit v0 = %g %g %g %g  mat alpha %g emis %g %g %g\n",
                             lc[0], lc[1], lc[2], lc[3], reg_f(0x03B4),
@@ -2332,9 +2345,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     static int inited;
 
     s_reg[(method & 0x1FFCu) / 4] = param;
-    if (method == 0x1D70 && s_sem_va) {     /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+    /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+     * semaphore word; SET_SEMAPHORE_OFFSET is not added (in one title it
+     * held 0xFF000000 at times, which put the write outside guest memory). */
+    if (method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va + s_reg[0x1D6C / 4]) = param;
+        *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
     if (!inited) {
