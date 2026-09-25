@@ -66,9 +66,16 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+/* Linear resampler state per voice (see voice_resample). */
+static struct {
+    float pos; float a[2], b[2]; int primed;
+    float buf[32][2]; int head, count;     /* fetched, not yet consumed */
+} s_rs[MCPX_HW_MAX_VOICES];
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    memset(&s_rs[v], 0, sizeof s_rs[v]);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -954,23 +961,57 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    /* The voice's pitch sets how fast it steps through its buffer: `rate` is
+     * output/input (xemu hands it to libsamplerate), so each 48 kHz output
+     * sample advances 1/rate source samples. This used to copy source samples
+     * straight out, which played every 22-24 kHz voice at twice its speed
+     * and an octave up -- the chipmunk voices.
+     *
+     * Linear interpolation between the last two fetched samples, one source
+     * sample fetched at a time. ponytail: linear only; a windowed-sinc
+     * resampler is the upgrade if the high end sounds dull. */
+    float step = rate > 0.0f ? 1.0f / rate : 1.0f;
+    int n = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (step > 64.0f) step = 64.0f;
+    while (n < requested_num) {
+        /* Advance until the output position lies between a and b. */
+        while (!s_rs[v].primed || s_rs[v].pos >= 1.0f) {
+            float next[1][2];
+            if (!s_rs[v].count) {       /* refill: a block at a time, not a sample */
+                int got;
+                if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                    return n ? n : -1;
+                memset(s_rs[v].buf, 0, sizeof s_rs[v].buf);
+                got = voice_get_samples(d, v, s_rs[v].buf, 32);
+                if (got <= 0)
+                    return n ? n : -1;
+                s_rs[v].head = 0;
+                s_rs[v].count = got;
+            }
+            next[0][0] = s_rs[v].buf[s_rs[v].head][0];
+            next[0][1] = s_rs[v].buf[s_rs[v].head][1];
+            s_rs[v].head++;
+            s_rs[v].count--;
+            if (!s_rs[v].primed) {
+                s_rs[v].b[0] = next[0][0];
+                s_rs[v].b[1] = next[0][1];
+                s_rs[v].primed = 1;
+                s_rs[v].pos = 1.0f;          /* need one more for a..b */
+            }
+            s_rs[v].a[0] = s_rs[v].b[0];
+            s_rs[v].a[1] = s_rs[v].b[1];
+            s_rs[v].b[0] = next[0][0];
+            s_rs[v].b[1] = next[0][1];
+            s_rs[v].pos -= 1.0f;
+        }
+        samples[n][0] = s_rs[v].a[0] + (s_rs[v].b[0] - s_rs[v].a[0]) * s_rs[v].pos;
+        samples[n][1] = s_rs[v].a[1] + (s_rs[v].b[1] - s_rs[v].a[1]) * s_rs[v].pos;
+        s_rs[v].pos += step;
+        n++;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return n;
 }
 
 /* ============================================================
@@ -1208,8 +1249,8 @@ void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea)
     dst = peak > 0.0f ? g_tr_loud : g_tr_quiet;
     if (*dst) return;
     snprintf(dst, sizeof g_tr_loud,
-             "v%03X peak %.3f ea %.2f fmt %08X vbin %08X vola %08X volb %08X ba %08X ebo %X cbo %X",
-             v, peak, ea,
+             "v%03X peak %.3f ea %.2f rate %.3f fmt %08X vbin %08X vola %08X volb %08X ba %08X ebo %X cbo %X",
+             v, peak, ea, g_dbg.vp.v[v].rate,
              voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
              voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF),
              voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF),
