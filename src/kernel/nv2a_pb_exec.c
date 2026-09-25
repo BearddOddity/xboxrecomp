@@ -1878,6 +1878,45 @@ static void backend_batch(void)
     if (!n)
         return;
 
+    if (getenv("RECOMP_DBG_CULL")) {    /* per second: path x cull state */
+        static struct { uint32_t key, n; } seen[16];
+        static DWORD next;
+        {   /* mirrored transform? sign of the composite's 3x3 (rows x, y, w) */
+            const float *m = s_gpu.composite;
+            float det = m[0] * (m[5] * m[14] - m[6] * m[13])
+                      - m[1] * (m[4] * m[14] - m[6] * m[12])
+                      + m[2] * (m[4] * m[13] - m[5] * m[12]);
+            static uint32_t pos_n, neg_n, skin_n;
+            static DWORD next_det;
+            if (s_gpu.rs.cull_enable) {
+                if (det > 0) pos_n++; else neg_n++;
+                if (s_reg[0x0328 / 4]) skin_n++;
+            }
+            if (GetTickCount() > next_det) {
+                next_det = GetTickCount() + 2000;
+                fprintf(stderr, "[DBG-CULL] culled batches: det+ %u det- %u skin-mode %u (skin reg 0x%X)\n",
+                        pos_n, neg_n, skin_n, s_reg[0x0328 / 4]);
+                pos_n = neg_n = skin_n = 0;
+            }
+        }
+        uint32_t key = (batch_is_vp() ? 0x1000u : batch_is_ffp() ? 0x2000u : 0x3000u)
+                     | (s_gpu.rs.cull_enable ? 0x100u : 0) | ((s_gpu.rs.cull_face & 0xF) << 4)
+                     | (s_gpu.rs.front_face & 0xF);
+        int k;
+        for (k = 0; k < 16 && seen[k].n && seen[k].key != key; k++)
+            ;
+        if (k < 16) { seen[k].key = key; seen[k].n++; }
+        if (GetTickCount() > next) {
+            next = GetTickCount() + 2000;
+            for (k = 0; k < 16 && seen[k].n; k++) {
+                fprintf(stderr, "[DBG-CULL] %s cull %u face 0x40%X front 0x90%X: %u batches\n",
+                        (seen[k].key >> 12) == 1 ? "vp " : (seen[k].key >> 12) == 2 ? "ffp" : "pre",
+                        (seen[k].key >> 8) & 1, (seen[k].key >> 4) & 0xF, seen[k].key & 0xF, seen[k].n);
+                seen[k].n = 0;
+            }
+        }
+    }
+
     current_surface(&surf);
     batch.vertices = s_bverts;
     batch.count = n;
