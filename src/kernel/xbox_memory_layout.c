@@ -215,23 +215,6 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 };
 
 /*
- * The opposite: request bits hardware clears when the operation completes, and
- * software spins on until it does. With plain memory the bit stays set.
- *
- * XDK D3D's CDevice::KickOff (X-Men Legends 0x0035FC00) flushes the
- * write-combine buffers before advancing DMA_PUT:
- *
- *   [nv2a + 0x100410] |= 0x10000;
- *   while ([nv2a + 0x100410] & 0x10000) ;
- *
- * It takes that path once geometry submission gets heavy -- in X-Men Legends
- * the first mission load, which then hung forever on its loading screen.
- */
-static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_SELF_CLEAR[] = {
-    { 0x100410, 0x00010000u },  /* PFB write-combine flush request */
-};
-
-/*
  * PFIFO channel DMA pointers. Software writes DMA_PUT and spins until the GPU
  * advances DMA_GET to match -- "you have consumed everything I submitted".
  * Halo's wait is at 0x001F3948:
@@ -761,30 +744,49 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+static void nv2a_ack_flags(volatile uint32_t *regs)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        if (*r & NV2A_ACK[i].busy_mask) {
+            *r &= ~NV2A_ACK[i].busy_mask;
+        }
+    }
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+            *r |= NV2A_IDLE[i].idle_mask;
+        }
+    }
+}
+
+/* Busy/idle flags, on a thread of their own.
+ *
+ * Software sets a request bit and spins until "hardware" clears it -- XDK
+ * D3D's CDevice::KickOff does this on every kickoff ([nv2a + 0x100410] bit
+ * 16, the write-combine flush). The thread below this one also runs the
+ * pushbuffer executor and the render back end, so one pass of it can take a
+ * whole frame; with the flags cleared only there, every kickoff waited a
+ * frame. X-Men Legends' mission load, thousands of kickoffs long, looked
+ * frozen on its loading screen. Clearing the flags is a few loads and stores,
+ * so it gets a loop that does nothing else. */
+static DWORD WINAPI nv2a_flag_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        nv2a_ack_flags(regs);
+        Sleep(0);
+    }
+    return 0;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
-        }
-        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
-            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-                *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
-        for (size_t i = 0; i < sizeof(NV2A_SELF_CLEAR) / sizeof(NV2A_SELF_CLEAR[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_SELF_CLEAR[i].offset);
-            if (*r & NV2A_SELF_CLEAR[i].busy_mask)
-                *r &= ~NV2A_SELF_CLEAR[i].busy_mask;
-        }
+        nv2a_ack_flags(regs);
         {
             volatile uint32_t *put =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -908,6 +910,9 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    /* ponytail: not joined at shutdown; it only reads and writes guest RAM
+     * and stops with g_nv2a_ack_stop like the thread above. */
+    CloseHandle(CreateThread(NULL, 0, nv2a_flag_thread, g_nv2a_memory, 0, NULL));
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
