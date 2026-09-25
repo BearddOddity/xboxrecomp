@@ -215,6 +215,23 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 };
 
 /*
+ * The opposite: request bits hardware clears when the operation completes, and
+ * software spins on until it does. With plain memory the bit stays set.
+ *
+ * XDK D3D's CDevice::KickOff (a title 0x0035FC00) flushes the
+ * write-combine buffers before advancing DMA_PUT:
+ *
+ *   [nv2a + 0x100410] |= 0x10000;
+ *   while ([nv2a + 0x100410] & 0x10000) ;
+ *
+ * It takes that path once geometry submission gets heavy -- in one title
+ * the first mission load, which then hung forever on its loading screen.
+ */
+static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_SELF_CLEAR[] = {
+    { 0x100410, 0x00010000u },  /* PFB write-combine flush request */
+};
+
+/*
  * PFIFO channel DMA pointers. Software writes DMA_PUT and spins until the GPU
  * advances DMA_GET to match -- "you have consumed everything I submitted".
  * Halo's wait is at 0x001F3948:
@@ -761,6 +778,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
             }
+        }
+        for (size_t i = 0; i < sizeof(NV2A_SELF_CLEAR) / sizeof(NV2A_SELF_CLEAR[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_SELF_CLEAR[i].offset);
+            if (*r & NV2A_SELF_CLEAR[i].busy_mask)
+                *r &= ~NV2A_SELF_CLEAR[i].busy_mask;
         }
         {
             volatile uint32_t *put =
