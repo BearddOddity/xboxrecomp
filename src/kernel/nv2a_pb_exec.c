@@ -2012,6 +2012,26 @@ static void draw_primitive(void)
         if (s_gpu.flips >= (uint32_t)from && shown++ < (from ? 3000 : 6)) {
             fprintf(stderr, "  [GPU] --- batch at flip %u, xform mode %u, tex fmt 0x%08X addr %u/%u\n",
                     s_gpu.flips, s_gpu.xform_mode, s_tex_reg[1], s_gpu.tex.addr_u, s_gpu.tex.addr_v);
+            if (batch_is_vp()) {
+                static int prog_shown;
+                uint32_t pc;
+                if (!prog_shown++) {
+                    fprintf(stderr, "  [VP] start %u load %u const_load %u\n",
+                            s_vp.prog_start, s_vp.prog_load, s_vp.const_load);
+                    for (pc = s_vp.prog_start; pc < VP_SLOTS && pc < s_vp.prog_start + 40; pc++) {
+                        fprintf(stderr, "  [VP] %3u: %08X %08X %08X %08X\n", pc,
+                                s_vp.prog[pc][0], s_vp.prog[pc][1],
+                                s_vp.prog[pc][2], s_vp.prog[pc][3]);
+                        if (s_vp.prog[pc][3] & 1)
+                            break;
+                    }
+                    for (pc = 0; pc < VP_CONSTS; pc++)
+                        if (s_vp.c[pc][0] != 0.0f || s_vp.c[pc][1] != 0.0f
+                         || s_vp.c[pc][2] != 0.0f || s_vp.c[pc][3] != 0.0f)
+                            fprintf(stderr, "  [VP] c%-3u %g %g %g %g\n", pc,
+                                    s_vp.c[pc][0], s_vp.c[pc][1], s_vp.c[pc][2], s_vp.c[pc][3]);
+                }
+            }
             {
                 uint32_t k;
                 float sp[4];
