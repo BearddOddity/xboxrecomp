@@ -380,6 +380,85 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  */
 static int g_thread_call_count = 0;
 
+/* ── Guest thread objects ──────────────────────────────────────
+ *
+ * The title reaches a thread's KTHREAD through KeGetCurrentThread or
+ * ObReferenceObjectByHandle and hands it to KeSetBasePriorityThread /
+ * KeSetPriorityThread. Both used to return 0, so every priority change named
+ * "thread 0", reached SetThreadPriority as a bogus HANDLE, and failed: all
+ * guest threads ran at one priority. The Xbox runs them on one core with
+ * strict priorities, and titles depend on that ordering (one title's CRI
+ * movie server finishes with a handle before the lower-priority main thread
+ * tears the pool down).
+ *
+ * The KTHREAD a thread gets is its own TIB address: real guest memory, unique
+ * per thread, so a stray read of a KTHREAD field is harmless. A small table
+ * maps it back to the host thread.
+ *
+ * ponytail: linear table of 64 threads; titles create a handful. */
+#define GUEST_THREADS_MAX 64
+static struct { uint32_t kthread; DWORD tid; HANDLE h; } s_guest_threads[GUEST_THREADS_MAX];
+static SRWLOCK s_guest_threads_lock = SRWLOCK_INIT;
+
+/* The calling thread's KTHREAD, registering the thread on first use. */
+static uint32_t guest_thread_self(void)
+{
+    DWORD tid = GetCurrentThreadId();
+    uint32_t kthread = g_fs_base;
+    int i, free_slot = -1;
+
+    AcquireSRWLockExclusive(&s_guest_threads_lock);
+    for (i = 0; i < GUEST_THREADS_MAX; i++) {
+        if (s_guest_threads[i].tid == tid) {
+            s_guest_threads[i].kthread = kthread;
+            ReleaseSRWLockExclusive(&s_guest_threads_lock);
+            return kthread;
+        }
+        if (free_slot < 0 && !s_guest_threads[i].tid)
+            free_slot = i;
+    }
+    if (free_slot >= 0) {
+        HANDLE h = NULL;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                        &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        s_guest_threads[free_slot].kthread = kthread;
+        s_guest_threads[free_slot].tid = tid;
+        s_guest_threads[free_slot].h = h;
+    }
+    ReleaseSRWLockExclusive(&s_guest_threads_lock);
+    return kthread;
+}
+
+static HANDLE guest_thread_host(uint32_t kthread)
+{
+    HANDLE h = NULL;
+    int i;
+    AcquireSRWLockShared(&s_guest_threads_lock);
+    for (i = 0; i < GUEST_THREADS_MAX; i++)
+        if (s_guest_threads[i].tid && s_guest_threads[i].kthread == kthread) {
+            h = s_guest_threads[i].h;
+            break;
+        }
+    ReleaseSRWLockShared(&s_guest_threads_lock);
+    return h;
+}
+
+/* KTHREAD of the thread behind a host handle; 0 if that thread has not run
+ * guest code yet (it registers itself when it starts). */
+static uint32_t guest_thread_by_tid(DWORD tid)
+{
+    uint32_t k = 0;
+    int i;
+    AcquireSRWLockShared(&s_guest_threads_lock);
+    for (i = 0; i < GUEST_THREADS_MAX; i++)
+        if (s_guest_threads[i].tid == tid) {
+            k = s_guest_threads[i].kthread;
+            break;
+        }
+    ReleaseSRWLockShared(&s_guest_threads_lock);
+    return k;
+}
+
 /* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
  * two Xbox start-context arguments plus the dummy return address the callee's
  * `ret` consumes, and runs. */
@@ -434,6 +513,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
                             " it shares the main thread's\n");
     }
     free(s);
+    guest_thread_self();
 
     bridge_run_thread_inline(fn, ctx1, ctx2);
 
@@ -3617,7 +3697,22 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t object = 0;
+
+    (void)obj_type;
+    if (handle == 0xFFFFFFFEu) {                   /* NtCurrentThread() */
+        object = guest_thread_self();
+    } else {
+        HANDLE h = bridge_resolve_handle(handle);
+        DWORD tid = h ? GetThreadId(h) : 0;
+        if (tid) {
+            /* A just-created thread registers itself when it starts running. */
+            int tries;
+            for (tries = 0; tries < 200 && !(object = guest_thread_by_tid(tid)); tries++)
+                Sleep(1);
+        }
+    }
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = object;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
@@ -3825,14 +3920,18 @@ static void bridge_KeDisconnectInterrupt(void)
  * missing, so the thunk fell through to the fallback and returned 0. */
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    HANDLE h = guest_thread_host(STACK_ARG(0));
+    g_eax = h ? (uint32_t)xbox_KeQueryBasePriorityThread(h) : 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    HANDLE h = guest_thread_host(STACK_ARG(0));
+    static int shown;
+    if (shown++ < 16)
+        fprintf(stderr, "  [KERNEL] KeSetBasePriorityThread(0x%08X, %d)%s\n",
+                STACK_ARG(0), (int)STACK_ARG(1), h ? "" : " -- unknown thread");
+    g_eax = h ? (uint32_t)xbox_KeSetBasePriorityThread(h, (LONG)STACK_ARG(1)) : 0;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
@@ -6927,11 +7026,30 @@ static void bridge_KeSetPriorityProcess(void)
 }
 
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
+/* Absolute Xbox priority (0..31; 8 is normal, 16+ is real-time) onto the
+ * Win32 levels, which only exist relative to the process class. */
+static int xbox_abs_priority_to_win32(LONG p)
+{
+    if (p >= 16) return THREAD_PRIORITY_TIME_CRITICAL;
+    if (p >= 13) return THREAD_PRIORITY_HIGHEST;
+    if (p >= 10) return THREAD_PRIORITY_ABOVE_NORMAL;
+    if (p >= 8)  return THREAD_PRIORITY_NORMAL;
+    if (p >= 6)  return THREAD_PRIORITY_BELOW_NORMAL;
+    if (p >= 1)  return THREAD_PRIORITY_LOWEST;
+    return THREAD_PRIORITY_IDLE;
+}
+
 static void bridge_KeSetPriorityThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    HANDLE h = guest_thread_host(STACK_ARG(0));
+    LONG p = (LONG)STACK_ARG(1);
+    static int shown;
+    if (shown++ < 16)
+        fprintf(stderr, "  [KERNEL] KeSetPriorityThread(0x%08X, %d)%s\n",
+                STACK_ARG(0), (int)p, h ? "" : " -- unknown thread");
+    g_eax = 8;                                   /* previous: assume normal */
+    if (h)
+        SetThreadPriority(h, xbox_abs_priority_to_win32(p));
 }
 
 /* --- KeTestAlertThread (ordinal 155, 1 arg = 4 bytes) --- */
@@ -6965,7 +7083,7 @@ static void bridge_KeGetCurrentIrql(void)
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    g_eax = guest_thread_self();
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
