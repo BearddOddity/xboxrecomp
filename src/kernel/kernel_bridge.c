@@ -2909,6 +2909,12 @@ static void bridge_RtlInitAnsiString(void)
     g_eax = 0;
 }
 
+/* File I/O counters, see xbox_io_get_stats. */
+static struct {
+    uint64_t opens, open_fails, reads, bytes, read_us_max;
+    char last[160];
+} s_io;
+
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
 static void bridge_NtCreateFile(void)
 {
@@ -2981,6 +2987,37 @@ static void bridge_NtCreateFile(void)
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
     fflush(stderr);
+    /* Vitals: opens, misses and the last file opened. */
+    if (g_eax) {
+        s_io.open_fails++;
+    } else {
+        const wchar_t *w = xbox_LastHostPath();
+        size_t n = 0;
+        s_io.opens++;
+        while (w && w[n] && n < sizeof(s_io.last) - 1) {
+            s_io.last[n] = (char)w[n];
+            n++;
+        }
+        s_io.last[n] = 0;
+    }
+}
+
+/* File I/O totals for a title's vitals monitor: out[] = opens, failed opens,
+ * reads, bytes read, slowest read in microseconds (reset by each call); `last`
+ * receives the host path of the most recently opened file.
+ * ponytail: unlocked counters, read once a second. */
+void xbox_io_get_stats(uint64_t out[5], char *last, int last_size)
+{
+    out[0] = s_io.opens;
+    out[1] = s_io.open_fails;
+    out[2] = s_io.reads;
+    out[3] = s_io.bytes;
+    out[4] = s_io.read_us_max;
+    s_io.read_us_max = 0;
+    if (last && last_size > 0) {
+        strncpy(last, s_io.last, (size_t)last_size - 1);
+        last[last_size - 1] = 0;
+    }
 }
 
 /* ── NtOpenFile (ordinal 202, 6 args = 24 bytes) ──────── */
@@ -3220,8 +3257,20 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {
+        static LARGE_INTEGER f;
+        LARGE_INTEGER a, b;
+        uint64_t us;
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(buffer_va), length, poff);
+        QueryPerformanceCounter(&b);
+        us = (uint64_t)((b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+        s_io.reads++;
+        s_io.bytes += ios.Information;
+        if (us > s_io.read_us_max) s_io.read_us_max = us;
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look

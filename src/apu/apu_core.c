@@ -274,37 +274,36 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path: one block per 8 EP frames.
+     *
+     * The DSP stage has just written this block's 256 samples (8 frames x 32)
+     * into frame_buf -- the guest's own audio. This used to clear frame_buf
+     * first and then submit 1024 samples per call: every sample the game
+     * produced was erased (the output was silent, peak -99 dB, in menus,
+     * movies and levels alike), and four times real time was pushed, so the
+     * queue dropped ~140 blocks a second. Now the block is kept, the software
+     * mixer and test tone are added on top, exactly 256 samples go out, and
+     * the buffer is cleared afterwards for the next block. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int n = MIXER_FRAME_SAMPLES;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < n; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        else
+            mixer_render(d->monitor.frame_buf, n);
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, n);
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         return;
     }
 
@@ -353,6 +352,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         out_offset += chunk;
         remaining -= chunk;
     }
+
+    /* Volume + limiter, as on the XAudio2 path. */
+    apu_output_safety(out, out, WAVEOUT_BUF_SAMPLES * 2);
 
     /* Submit to waveOut */
     hdr->dwFlags &= ~WHDR_DONE;
