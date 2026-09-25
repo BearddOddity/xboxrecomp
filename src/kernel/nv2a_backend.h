@@ -14,10 +14,13 @@
  * end may create its window and device lazily on the first call and pump its
  * window messages from flip().
  *
- * ponytail: fixed-function and pre-transformed batches only; vertex-program
- * batches are still skipped (the executor does not run programs yet), and
- * blend/depth/combiner state is not passed on. Extend Nv2aBatch when those
- * land rather than adding callbacks.
+ * Fixed-function, pre-transformed and vertex-program batches all arrive the
+ * same way: the executor transforms fixed-function vertices itself and runs
+ * vertex programs on the CPU (vp_run), so a back end only ever sees surface
+ * pixels. Blend, depth and alpha state arrive in Nv2aRenderState.
+ *
+ * ponytail: register-combiner state is not passed on. Extend Nv2aBatch when
+ * it lands rather than adding callbacks.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
