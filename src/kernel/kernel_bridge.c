@@ -2297,46 +2297,16 @@ static void kernel_vblank_tick(void)
     }
 }
 
-/* Device interrupt lines, level-triggered, one bit per vector.
- *
- * A device model (the APU on vector 5) asserts its line; the timer thread
- * wakes at once and calls the connected ISR, and keeps calling it each tick
- * while the line stays up. The ISR acknowledges in the device's own status
- * register, which is what lowers the line.
- *
- * ponytail: ISRs run on the timer thread with no IRQL and no interrupt
- * spinlock, like the vblank above; KeSynchronizeExecution takes no lock
- * either. Add the interrupt object's lock if a driver is seen racing its ISR.
- */
-static volatile LONG g_irq_lines;
-static HANDLE        g_irq_event;
-
-static HANDLE irq_event(void)
-{
-    if (!g_irq_event) {
-        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
-        if (InterlockedCompareExchangePointer(&g_irq_event, e, NULL))
-            CloseHandle(e);
-    }
-    return g_irq_event;
-}
-
-void xbox_set_irq_line(uint32_t vector, int level)
-{
-    if (vector >= 32)
-        return;
-    if (level) {
-        InterlockedOr(&g_irq_lines, (LONG)(1u << vector));
-        SetEvent(irq_event());
-    } else {
-        InterlockedAnd(&g_irq_lines, ~(LONG)(1u << vector));
-    }
-}
+/* Device interrupt lines live in xbox_devbus.c, so a device model can raise
+ * one without linking the whole bridge (tests/apu_mixdown links the APU
+ * alone). The timer thread below services them. */
+HANDLE   xbox_irq_line_event(void);
+uint32_t xbox_irq_lines(void);
 
 static void kernel_service_irqs(void)
 {
     static unsigned logged;
-    uint32_t v, lines = (uint32_t)g_irq_lines;
+    uint32_t v, lines = xbox_irq_lines();
 
     for (v = 0; lines; v++, lines >>= 1) {
         int claimed;
@@ -2616,7 +2586,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        WaitForSingleObject(irq_event(), 10);   /* a device interrupt, or 10 ms */
+        WaitForSingleObject(xbox_irq_line_event(), 10);   /* a device interrupt, or 10 ms */
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */

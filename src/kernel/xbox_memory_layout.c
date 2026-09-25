@@ -2696,6 +2696,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
 
     g_contig_next = result + size;
+    xbox_ContiguousSetPhysicalRange(g_contig_start - XBOX_CONTIG_BASE,
+                                    g_contig_next  - XBOX_CONTIG_BASE);
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
@@ -2710,14 +2712,10 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
-/* Does this physical (bus) address name memory the contiguous arena handed
- * out? If so it is reached at XBOX_CONTIG_BASE + phys; otherwise it is a
- * pass-through VA (see g_contig_start). */
-int xbox_ContiguousIsPhysical(uint32_t phys)
-{
-    return phys >= g_contig_start - XBOX_CONTIG_BASE
-        && phys <  g_contig_next  - XBOX_CONTIG_BASE;
-}
+/* xbox_ContiguousIsPhysical lives in xbox_devbus.c, where a device model can
+ * reach it without linking the kernel; every change to the arena is published
+ * there. */
+void xbox_ContiguousSetPhysicalRange(uint32_t lo, uint32_t hi);
 
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
