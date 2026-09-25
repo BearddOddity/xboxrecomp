@@ -801,8 +801,12 @@ static int fetch_position(uint32_t index, float out[4])
     for (i = 0; i < 4; i++)
         out[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
                + m[4 * i + 2] * in[2] + m[4 * i + 3];
+    /* A vertex behind the camera (w < 0) is kept: the back end clips in
+     * homogeneous space, and rejecting it dropped every batch that reached
+     * behind the eye -- X-Men Legends' street and sidewalk meshes, which
+     * extend past a top-down camera, never drew. Only w = 0 has no image. */
     w = out[3];
-    if (w <= 1e-6f)
+    if (fabsf(w) <= 1e-6f)
         return 0;
     out[0] = (out[0] / w + s_gpu.vp_offset[0]) * s_gpu.aa_sx;
     out[1] = (out[1] / w + s_gpu.vp_offset[1]) * s_gpu.aa_sy;
@@ -1571,6 +1575,17 @@ static int lit_color(uint32_t index, float out[4])
     }
     len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    /* Light the side the viewer sees. Some meshes carry normals that face
+     * away from the camera (X-Men Legends' streets and sidewalks: authentic
+     * file data, drawn with culling off), and lighting them as stored left
+     * only the light's ambient term -- black ground. Flipping a normal that
+     * points away from the eye is two-sided lighting with the back material
+     * equal to the front one.
+     * ponytail: per vertex, not per face; exact for flat ground, a vertex on
+     * a silhouette may pick the other side. */
+    if (n[0] * e[0] + n[1] * e[1] + n[2] * e[2] > 0.0f) {
+        n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2];
+    }
 
     out[0] = reg_f(0x0A10); out[1] = reg_f(0x0A14); out[2] = reg_f(0x0A18);
     for (i = 0; i < NV_LIGHTS; i++) {
@@ -1764,6 +1779,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
      || !fetch_position(i1, p[1])
      || !fetch_position(i2, p[2]))
         return;
+    if (p[0][3] < 0.0f || p[1][3] < 0.0f || p[2][3] < 0.0f)
+        return;                /* behind the eye: the CPU path cannot clip */
 
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
@@ -2004,8 +2021,21 @@ static void draw_primitive(void)
                     fprintf(stderr, "  [GPU]   IMV %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
                             im[0], im[1], im[2], im[3], im[4], im[5], im[6], im[7],
                             im[8], im[9], im[10], im[11], im[12], im[13], im[14], im[15]);
-                    if (s_gpu.idx_count && fetch_attr(&s_gpu.attr[2], s_gpu.idx[0], nn))
-                        fprintf(stderr, "  [GPU]   normal v0 %g %g %g\n", nn[0], nn[1], nn[2]);
+                    if (s_gpu.idx_count && fetch_attr(&s_gpu.attr[2], s_gpu.idx[0], nn)) {
+                        float pp[4], ee[3], ne[3];
+                        int q;
+                        fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], pp);
+                        for (q = 0; q < 3; q++) {
+                            ee[q] = mv[4*q]*pp[0] + mv[4*q+1]*pp[1] + mv[4*q+2]*pp[2] + mv[4*q+3];
+                            ne[q] = mv[4*q]*nn[0] + mv[4*q+1]*nn[1] + mv[4*q+2]*nn[2];
+                        }
+                        fprintf(stderr, "  [GPU]   normal v0 %g %g %g | eye pos %g %g %g | eye n %g %g %g | n.toEye %g"
+                                        " | half0 %g %g %g half1 %g %g %g | twoside %u\n",
+                                nn[0], nn[1], nn[2], ee[0], ee[1], ee[2], ne[0], ne[1], ne[2],
+                                -(ee[0]*ne[0] + ee[1]*ne[1] + ee[2]*ne[2]),
+                                reg_f(0x1028), reg_f(0x102C), reg_f(0x1030),
+                                reg_f(0x10A8), reg_f(0x10AC), reg_f(0x10B0), s_reg[0x17C4 / 4]);
+                    }
                 }
                 if (s_gpu.idx_count && lit_color(s_gpu.idx[0], lc))
                     fprintf(stderr, "  [GPU]   lit v0 = %g %g %g %g  mat alpha %g emis %g %g %g\n",
@@ -2345,6 +2375,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     static int inited;
 
     s_reg[(method & 0x1FFCu) / 4] = param;
+    if (pb_verbose() && (method == 0x17C4 || (method >= 0x0C00 && method < 0x0C24))) {
+        static int shown;
+        if (shown++ < 20)
+            fprintf(stderr, "  [GPU] back-light method 0x%04X = 0x%08X\n", method, param);
+    }
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
