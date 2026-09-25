@@ -2505,6 +2505,26 @@ static int g_heap_alloc_count = 0;
 static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+/* Guest threads (DirectSound, CRI's movie threads, the game) allocate at
+ * once; the table was unguarded. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
+
+/* Insert a free block at index `at`, keeping address order. Reuses an empty
+ * slot (size 0, left behind by coalescing) when one is already there. */
+static int heap_insert_free(int at, uint32_t addr, uint32_t size)
+{
+    if (!(at < g_heap_block_count && g_heap_blocks[at].size == 0)) {
+        if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
+            return 0;
+        memmove(&g_heap_blocks[at + 1], &g_heap_blocks[at],
+                (size_t)(g_heap_block_count - at) * sizeof g_heap_blocks[0]);
+        g_heap_block_count++;
+    }
+    g_heap_blocks[at].addr = addr;
+    g_heap_blocks[at].size = size;
+    g_heap_blocks[at].free = 1;
+    return 1;
+}
 
 /*
  * Simulated stacks for spawned threads.
@@ -2700,7 +2720,18 @@ int xbox_ContiguousIsPhysical(uint32_t phys)
 }
 
 
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_locked(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2719,17 +2750,38 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
      * global_d3d_device, so the rasterizer asserts and startup stops. */
+    /* ...and take only what the request needs from it. Reuse used to hand
+     * over the whole block: a 16-byte request could take a freed 2 MB block,
+     * and once audio streaming started churning allocations the 48 MB heap
+     * drained in seconds (209 failed 2 MB requests, then no thread stack for
+     * the next movie's decoder, which then ran inline on the main thread and
+     * froze the game). The aligned piece is carved out; what is left in front
+     * and behind stays free. */
+    size = (size + 15) & ~15u;
     for (int i = 0; i < g_heap_block_count; i++) {
+        uint32_t a, start, end, front, back;
         if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
             continue;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+        a = g_heap_blocks[i].addr;
+        start = (a + alignment - 1) & ~(alignment - 1);
+        end = a + g_heap_blocks[i].size;
+        if (start + size > end || start + size < start) {
+            continue;   /* not enough room once aligned */
         }
+        front = start - a;
+        back = end - (start + size);
+        if (front && !heap_insert_free(i, a, front))
+            continue;   /* table full: leave this block alone */
+        if (front)
+            i++;        /* the taken piece moved up one slot */
+        g_heap_blocks[i].addr = start;
+        g_heap_blocks[i].size = size;
         g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
+        if (back && !heap_insert_free(i + 1, start + size, back))
+            g_heap_blocks[i].size += back;   /* table full: keep it attached */
+        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        return start;
     }
 
     /* Align the next pointer */
@@ -2812,17 +2864,22 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
     int i;
+    uint32_t r = 0;
 
     if (!xbox_va)
         return 0;
+    AcquireSRWLockShared(&g_heap_lock);
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
-            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
-            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
+            r = g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            break;
+        }
     }
-    return 0;
+    ReleaseSRWLockShared(&g_heap_lock);
+    return r;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
@@ -2832,6 +2889,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
+    AcquireSRWLockExclusive(&g_heap_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -2849,24 +2907,31 @@ void xbox_HeapFree(uint32_t xbox_va)
             fflush(stderr);
         }
 
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
-        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
-            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
-            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+        /* Coalesce with neighbours. Index order is address order, and
+         * adjacency is a simple end==start test -- stepping over the empty
+         * slots (size 0) earlier merges left behind, which used to stop a
+         * merge dead. Keeps large requests satisfiable after small churn. */
+        {
+            int n = i + 1, p = i - 1;
+            while (n < g_heap_block_count && g_heap_blocks[n].size == 0) n++;
+            while (p >= 0 && g_heap_blocks[p].size == 0) p--;
+            if (n < g_heap_block_count && g_heap_blocks[n].free &&
+                g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
+                g_heap_blocks[i].size += g_heap_blocks[n].size;
+                g_heap_blocks[n].size = 0;
+                g_heap_blocks[n].addr = 0;
+            }
+            if (p >= 0 && g_heap_blocks[p].free &&
+                g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
+                g_heap_blocks[p].size += g_heap_blocks[i].size;
+                g_heap_blocks[i].size = 0;
+                g_heap_blocks[i].addr = 0;
+            }
         }
-        if (i > 0 && g_heap_blocks[i - 1].free &&
-            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
-            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
-        }
+        ReleaseSRWLockExclusive(&g_heap_lock);
         return;
     }
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)

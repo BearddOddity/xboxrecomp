@@ -433,6 +433,22 @@ static uint32_t guest_thread_self(void)
     return kthread;
 }
 
+/* The calling thread is ending: free its slot (three threads per movie would
+ * otherwise fill the table within a few cutscenes). */
+static void guest_thread_forget(void)
+{
+    DWORD tid = GetCurrentThreadId();
+    int i;
+    AcquireSRWLockExclusive(&s_guest_threads_lock);
+    for (i = 0; i < GUEST_THREADS_MAX; i++)
+        if (s_guest_threads[i].tid == tid) {
+            if (s_guest_threads[i].h)
+                CloseHandle(s_guest_threads[i].h);
+            memset(&s_guest_threads[i], 0, sizeof s_guest_threads[i]);
+        }
+    ReleaseSRWLockExclusive(&s_guest_threads_lock);
+}
+
 static HANDLE guest_thread_host(uint32_t kthread)
 {
     HANDLE h = NULL;
@@ -478,6 +494,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
+    uint32_t tib;          /* allocated at creation: it is also the KTHREAD */
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -509,7 +526,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
-        uint32_t tib = xbox_AllocThreadTib();
+        uint32_t tib = s->tib ? s->tib : xbox_AllocThreadTib();
         if (tib)
             g_fs_base = tib;
         else
@@ -525,21 +542,104 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
+    guest_thread_forget();
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
     return 0;
 }
 
+/* A new guest thread starts when its creator next calls the kernel.
+ *
+ * On the Xbox's one CPU a thread just created does not run until its creator
+ * blocks or yields, so a title can create a thread and then store its handle
+ * where the thread will look for it. CRI's movie scheduler does exactly that
+ * (the handle goes to [0x5f59e8] after CreateThread returns) and then suspends
+ * "itself" through that slot. Started at once on its own host core, it read
+ * the previous movie's handle -- a value Windows had since reused for another
+ * live thread -- and suspended that thread, a decoder, for good: the new-game
+ * cutscene r102 froze every time once the movies ran at their real speed.
+ *
+ * So the host thread is created suspended and started at the creator's next
+ * kernel call (by then the handle is stored), or by the timer thread after
+ * 5 ms if the creator makes none.
+ *
+ * ponytail: a small global list under a lock; a title creates a few threads. */
+#define PENDING_START_MAX 16
+static struct { HANDLE th; DWORD creator; ULONGLONG t; } g_pending_start[PENDING_START_MAX];
+static volatile LONG g_pending_count;
+static SRWLOCK g_pending_lock = SRWLOCK_INIT;
+
+/* Start pending threads: the creator's own (creator != 0), or any older than
+ * 5 ms (creator == 0). */
+static void pending_start_flush(DWORD creator)
+{
+    ULONGLONG now = GetTickCount64();
+    int i;
+
+    if (!g_pending_count)
+        return;
+    AcquireSRWLockExclusive(&g_pending_lock);
+    for (i = 0; i < PENDING_START_MAX; i++) {
+        if (!g_pending_start[i].th)
+            continue;
+        if (creator ? g_pending_start[i].creator == creator
+                    : now - g_pending_start[i].t >= 5) {
+            ResumeThread(g_pending_start[i].th);
+            g_pending_start[i].th = NULL;
+            InterlockedDecrement(&g_pending_count);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_pending_lock);
+}
+
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  int create_suspended)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
+    int i;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->tib = xbox_AllocThreadTib();
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
+    /* Registered now, not when it first runs: the creator sets its priority
+     * (ObReferenceObjectByHandle -> KTHREAD) before starting it, and used to
+     * wait up to 200 ms per call for a thread that could not start until the
+     * creator moved on -- 2-3 s stalls in every movie. */
+    if (th && s->tib) {
+        int i;
+        AcquireSRWLockExclusive(&s_guest_threads_lock);
+        for (i = 0; i < GUEST_THREADS_MAX; i++)
+            if (!s_guest_threads[i].tid) {
+                DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(),
+                                &s_guest_threads[i].h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+                s_guest_threads[i].kthread = s->tib;
+                s_guest_threads[i].tid = GetThreadId(th);
+                break;
+            }
+        ReleaseSRWLockExclusive(&s_guest_threads_lock);
+    }
+    /* CreateSuspended (XAPI's CREATE_SUSPENDED): the title resumes the thread
+     * itself once it is ready. CRI's movie scheduler is created this way and
+     * resumed only after its handle is stored; the flag used to be ignored,
+     * which is how it came to read a stale handle in the first place. */
+    if (th && !create_suspended) {
+        AcquireSRWLockExclusive(&g_pending_lock);
+        for (i = 0; i < PENDING_START_MAX && g_pending_start[i].th; i++)
+            ;
+        if (i < PENDING_START_MAX) {
+            g_pending_start[i].th = th;
+            g_pending_start[i].creator = GetCurrentThreadId();
+            g_pending_start[i].t = GetTickCount64();
+            InterlockedIncrement(&g_pending_count);
+        }
+        ReleaseSRWLockExclusive(&g_pending_lock);
+        if (i == PENDING_START_MAX)
+            ResumeThread(th);          /* list full: start it now */
+    }
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -650,7 +750,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    (uint8_t)STACK_ARG(7));
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -1134,6 +1235,22 @@ static void bridge_NtFreeVirtualMemory(void)
             }
             g_eax = vm_status;
             return;
+        }
+        /* Memory NtAllocateVirtualMemory took from the heap. This used to fall
+         * through to the host VirtualFree below, which read the 32-bit guest
+         * slot as a 64-bit pointer and failed -- so nothing the title ever
+         * allocated this way came back, and one title's 2 MB pool segments
+         * filled the heap within seconds once its audio started streaming. */
+        {
+            extern uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+            if (xbox_HeapBlockSize(vm_base)) {
+                if (free_type & 0x8000) {          /* MEM_RELEASE */
+                    xbox_HeapFree(vm_base);
+                    BRIDGE_MEM32(size_ptr) = 0;
+                }                                  /* MEM_DECOMMIT: nothing to give back */
+                g_eax = 0;
+                return;
+            }
         }
     }
 
@@ -1896,6 +2013,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        guest_thread_forget();
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -2015,7 +2133,13 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        /* At device IRQL: holds the dispatch lock, so the ISR cannot run
+         * alongside (kernel_hal.c). */
+        KIRQL old = xbox_KfRaiseIrql(31);
+        fn();
+        xbox_KfLowerIrql(old);
+    }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2147,7 +2271,7 @@ static void kernel_vblank_tick(void)
     long long now;
 
     if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
+        enabled = getenv("RECOMP_VBLANK") && strcmp(getenv("RECOMP_VBLANK"), "0");
     if (!enabled)
         return;
 
@@ -2170,6 +2294,61 @@ static void kernel_vblank_tick(void)
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+    }
+}
+
+/* Device interrupt lines, level-triggered, one bit per vector.
+ *
+ * A device model (the APU on vector 5) asserts its line; the timer thread
+ * wakes at once and calls the connected ISR, and keeps calling it each tick
+ * while the line stays up. The ISR acknowledges in the device's own status
+ * register, which is what lowers the line.
+ *
+ * ponytail: ISRs run on the timer thread with no IRQL and no interrupt
+ * spinlock, like the vblank above; KeSynchronizeExecution takes no lock
+ * either. Add the interrupt object's lock if a driver is seen racing its ISR.
+ */
+static volatile LONG g_irq_lines;
+static HANDLE        g_irq_event;
+
+static HANDLE irq_event(void)
+{
+    if (!g_irq_event) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (InterlockedCompareExchangePointer(&g_irq_event, e, NULL))
+            CloseHandle(e);
+    }
+    return g_irq_event;
+}
+
+void xbox_set_irq_line(uint32_t vector, int level)
+{
+    if (vector >= 32)
+        return;
+    if (level) {
+        InterlockedOr(&g_irq_lines, (LONG)(1u << vector));
+        SetEvent(irq_event());
+    } else {
+        InterlockedAnd(&g_irq_lines, ~(LONG)(1u << vector));
+    }
+}
+
+static void kernel_service_irqs(void)
+{
+    static unsigned logged;
+    uint32_t v, lines = (uint32_t)g_irq_lines;
+
+    for (v = 0; lines; v++, lines >>= 1) {
+        int claimed;
+        if (!(lines & 1))
+            continue;
+        claimed = kernel_raise_interrupt(v);
+        if (logged < 5) {
+            logged++;
+            fprintf(stderr, "  [KERNEL] irq %u -> ISR %s\n", v,
+                    claimed < 0 ? "not connected" : claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
     }
 }
 
@@ -2437,8 +2616,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        WaitForSingleObject(irq_event(), 10);   /* a device interrupt, or 10 ms */
+        /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
+         * lock (kernel_hal.c), so none of them runs while a game thread is in
+         * a raised section. */
+        pending_start_flush(0); /* threads whose creator made no further call */
+        xbox_KfRaiseIrql(DISPATCH_LEVEL);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_service_irqs(); /* device interrupts; their DPCs drain below */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -2472,6 +2657,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        xbox_KfLowerIrql(PASSIVE_LEVEL);
     }
 }
 
@@ -7007,7 +7193,7 @@ static void bridge_KeLeaveCriticalRegion(void)
 /* --- KeRaiseIrqlToSynchLevel (ordinal 130, 0 args = 0 bytes) --- */
 static void bridge_KeRaiseIrqlToSynchLevel(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL; IRQL is not modelled */
+    g_eax = xbox_KfRaiseIrql(28);   /* SYNCH_LEVEL; takes the dispatch lock */
 }
 
 /* --- KeRemoveByKeyDeviceQueue (ordinal 133, 2 args = 8 bytes) --- */
@@ -7126,11 +7312,11 @@ static void bridge_KiUnlockDispatcherDatabase(void)
 }
 
 /* --- KeGetCurrentIrql (ordinal 103, 0 args = 0 bytes)
- * Stack-based with 0 args (not the Kf* fastcall form). IRQL is unmounted, so
- * report PASSIVE_LEVEL. */
+ * Stack-based with 0 args (not the Kf* fastcall form). */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    extern KIRQL xbox_CurrentIrql(void);
+    g_eax = xbox_CurrentIrql();
 }
 
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
@@ -7570,7 +7756,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, 0);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
@@ -9084,7 +9270,20 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+static void kernel_thunk_dispatch_body(void);
+
+/* Every kernel call is marked busy for its whole length (bridge locks, the CRT
+ * lock behind fprintf, the host heap), except while it blocks in a host wait;
+ * NtSuspendThread does not leave a thread suspended while it is busy. */
 static void kernel_thunk_dispatch(void)
+{
+    pending_start_flush(GetCurrentThreadId());   /* threads this one created */
+    xbox_kernel_busy(1);
+    kernel_thunk_dispatch_body();
+    xbox_kernel_busy(-1);
+}
+
+static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
