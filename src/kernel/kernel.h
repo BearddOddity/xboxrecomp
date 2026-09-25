@@ -780,6 +780,10 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
+
+/* This thread entering (+1) or leaving (-1) kernel code that may hold host
+ * locks; NtSuspendThread only leaves a thread suspended outside it. */
+void    xbox_kernel_busy(int delta);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);

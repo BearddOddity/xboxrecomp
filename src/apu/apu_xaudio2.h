@@ -21,6 +21,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Blocks submitted and not yet played (the device's own clock drains it). */
+int xa2_queued(void);
+
 /* Output health since start, for a title's vitals monitor. An underrun is a
  * submit that found nothing queued (playback ran dry: an audible gap); a drop
  * is a rendered block discarded because the queue was full (a skip). Both are

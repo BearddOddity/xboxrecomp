@@ -565,8 +565,14 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
                         unsigned int size)
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
+    static int trace = -1, traced;
     (void)size;
 
+    if (trace < 0) trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (trace && traced < 4000) {
+        traced++;
+        fprintf(stderr, "[APU-FE] %04X %08X\n", (unsigned)addr, (unsigned)val);
+    }
     /* Dispatch known methods through fe_method */
     fe_method(d, (uint32_t)addr, (uint32_t)val);
 }
@@ -843,8 +849,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
-                           block_size);
+                    memcpy(adpcm_block, apu_phys(addr), block_size);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
@@ -1044,7 +1049,11 @@ static void voice_process(MCPXAPUState *d,
             if (!active) return;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
-            if (count < 0) break;
+            /* 0 as well as -1: voice_resample returns 0 when the voice had
+             * nothing to give (paused, or a persistent stream with no packet
+             * queued), and retrying spun here forever holding the APU lock --
+             * which froze DirectSound's next register write, and the game. */
+            if (count <= 0) break;
             sample_count += count;
         }
     }
@@ -1052,6 +1061,14 @@ static void voice_process(MCPXAPUState *d,
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
+
+    {   /* RECOMP_APU_TRACE: what the unpaused voices hold */
+        extern void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea);
+        float pk = 0.0f;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            pk = fmaxf(pk, fmaxf(fabsf(samples[i][0]), fabsf(samples[i][1])));
+        apu_vp_trace_voice(d, v, pk, ea_value);
+    }
 
     /* Get volume bins */
     int bin[8];
@@ -1175,6 +1192,44 @@ static void voice_process(MCPXAPUState *d,
  * silence with none means the game started none. */
 static int   g_vp_voices_now, g_vp_voices_max;
 static float g_vp_mix_peak;
+
+/* RECOMP_APU_TRACE: once a second, how many voices were unpaused and how many
+ * fetched non-silent samples, with the registers of one of each kind. */
+static int   g_tr_on = -1, g_tr_unpaused, g_tr_sounding;
+static char  g_tr_quiet[200], g_tr_loud[200];
+
+void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea)
+{
+    char *dst;
+    if (g_tr_on < 0) g_tr_on = getenv("RECOMP_APU_TRACE") != NULL;
+    if (!g_tr_on) return;
+    g_tr_unpaused++;
+    if (peak > 0.0f) g_tr_sounding++;
+    dst = peak > 0.0f ? g_tr_loud : g_tr_quiet;
+    if (*dst) return;
+    snprintf(dst, sizeof g_tr_loud,
+             "v%03X peak %.3f ea %.2f fmt %08X vbin %08X vola %08X volb %08X ba %08X ebo %X cbo %X",
+             v, peak, ea,
+             voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+             voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF),
+             voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF),
+             voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFF),
+             voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, 0xFFFFFFFF),
+             voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+             voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO));
+}
+
+static void apu_vp_trace_second(void)
+{
+    static DWORD next;
+    if (g_tr_on <= 0 || GetTickCount() < next) return;
+    next = GetTickCount() + 1000;
+    fprintf(stderr, "[APU-VP] unpaused %d sounding %d (voice-frames/s) mixpeak %.3f\n"
+                    "[APU-VP]   quiet: %s\n[APU-VP]   loud:  %s\n",
+            g_tr_unpaused, g_tr_sounding, g_vp_mix_peak, g_tr_quiet, g_tr_loud);
+    g_tr_unpaused = g_tr_sounding = 0;
+    g_tr_quiet[0] = g_tr_loud[0] = 0;
+}
 void apu_vp_get_stats(int *voices, float *mix_peak)
 {
     *voices = g_vp_voices_max;
@@ -1225,6 +1280,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             float a = fabsf(mixbins[b][s]);
             if (a > g_vp_mix_peak) g_vp_mix_peak = a;
         }
+    apu_vp_trace_second();
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

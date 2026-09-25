@@ -55,8 +55,15 @@ void mcpx_debug_begin_frame(void) {}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * IRQ handling: the APU's line goes to the kernel, which calls the
+ * title's connected ISR (DirectSound's) on vector 5.
  * ============================================================ */
+
+#if defined(_WIN32)
+extern void xbox_set_irq_line(uint32_t vector, int level);
+#define pci_irq_assert(dev)   xbox_set_irq_line(5, 1)
+#define pci_irq_deassert(dev) xbox_set_irq_line(5, 0)
+#endif
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -374,6 +381,27 @@ static void throttle(MCPXAPUState *d)
         return;
     }
 
+    /* With XAudio2, pace by its queue: render the next 256-sample block once
+     * fewer than 8 (43 ms) are waiting. 4 (21 ms) still ran dry: this thread
+     * was measured going 20-44 ms between blocks while the game was busy. The sound card's clock drains the
+     * queue, so output never drifts from it, and a stall is caught up with a
+     * burst instead of being forgotten. The wall-clock pacing below reset
+     * itself after any stall longer than one frame, so every stall was lost
+     * for good and the queue ran dry: 4-10 underruns a second, heard as
+     * crackle. */
+    if (xa2_is_active()) {
+        int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        /* Let a guest register write in once per block even when behind and
+         * not waiting: that writer can be holding the dispatch lock. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
+        while (!d->pause_requested && xa2_queued() >= 8)
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
+        return;
+    }
+
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     if (d->next_frame_time_us == 0 ||
@@ -427,6 +455,13 @@ static void se_frame(MCPXAPUState *d)
 
     d->ep_frame_div++;
 
+    /* The front end trapped this frame (an idle voice the driver asked to
+     * hear about): raise it now, or the trap halts the pipeline unseen. */
+    if (d->set_irq) {
+        d->set_irq = false;
+        update_irq(d);
+    }
+
     mcpx_debug_end_frame();
 }
 
@@ -437,6 +472,9 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* Audio misses are audible, a late game frame is not: stay ahead of the
+     * game's busy threads for the few microseconds a block takes. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
