@@ -373,23 +373,26 @@ static float reg_f(uint32_t method) { float f; memcpy(&f, &s_reg[method / 4], 4)
 static uint32_t s_sem_va;
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
 
+/* Slot + 1 of each method in s_unhandled: this runs millions of times a
+ * second, so no search. The report sorts s_unhandled and rebuilds it. */
+static uint16_t s_unhandled_slot[0x2000 / 4];
+
 static void note_unhandled(uint32_t method, uint32_t param)
 {
-    int i;
+    uint16_t *slot = &s_unhandled_slot[(method & 0x1FFC) / 4];
 
     s_gpu.unhandled_total++;
-    for (i = 0; i < s_unhandled_count; i++) {
-        if (s_unhandled[i].method == method) {
-            s_unhandled[i].count++;
-            s_unhandled[i].last_param = param;
-            return;
-        }
+    if (*slot) {
+        s_unhandled[*slot - 1].count++;
+        s_unhandled[*slot - 1].last_param = param;
+        return;
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        *slot = (uint16_t)s_unhandled_count;
     }
 }
 
@@ -1821,15 +1824,39 @@ static int backend_vertex(uint32_t index, Nv2aVertex *out)
     return 1;
 }
 
+/* Each vertex of a batch is transformed and lit once, not once per triangle
+ * that uses it: a strip shares each vertex between three triangles, so this
+ * roughly thirds the executor's per-vertex work. Direct-mapped on the low 16
+ * bits of the index, tagged with the full index and the batch generation.
+ * ponytail: indices 64K apart that collide just recompute. */
+#define NV_VCACHE 65536
+typedef struct { uint32_t gen, index; int ok; Nv2aVertex v; } VCacheEntry;
+static VCacheEntry s_vcache[NV_VCACHE];
+static uint32_t s_vcache_gen;
+
+static int backend_vertex_cached(uint32_t index, Nv2aVertex *out)
+{
+    VCacheEntry *e = &s_vcache[index & (NV_VCACHE - 1)];
+
+    if (e->gen != s_vcache_gen || e->index != index) {
+        e->gen = s_vcache_gen;
+        e->index = index;
+        e->ok = backend_vertex(index, &e->v);
+    }
+    if (e->ok)
+        *out = e->v;
+    return e->ok;
+}
+
 static void backend_tri(uint32_t i0, uint32_t i1, uint32_t i2, void *ctx)
 {
     uint32_t *n = (uint32_t *)ctx;
 
     if (*n + 3 > NV_BACKEND_MAX_VERTS)
         return;
-    if (backend_vertex(i0, &s_bverts[*n])
-     && backend_vertex(i1, &s_bverts[*n + 1])
-     && backend_vertex(i2, &s_bverts[*n + 2]))
+    if (backend_vertex_cached(i0, &s_bverts[*n])
+     && backend_vertex_cached(i1, &s_bverts[*n + 1])
+     && backend_vertex_cached(i2, &s_bverts[*n + 2]))
         *n += 3;
 }
 
@@ -1839,6 +1866,11 @@ static void backend_batch(void)
     Nv2aTexture tex;
     Nv2aBatch batch;
     uint32_t n = 0;
+
+    if (++s_vcache_gen == 0) {               /* wrapped: old tags could match */
+        memset(s_vcache, 0, sizeof s_vcache);
+        s_vcache_gen = 1;
+    }
 
     for_each_triangle(backend_tri, &n);
     if (!n)
@@ -2899,5 +2931,8 @@ void nv2a_pb_exec_report(void)
                     v.u, v.f);
         }
     }
-    }    fflush(stderr);
+    }
+    for (i = 0; i < s_unhandled_count; i++)       /* the sort moved them */
+        s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
+    fflush(stderr);
 }

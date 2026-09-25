@@ -862,8 +862,25 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * (depth function, and so on) sent before it. */
                     if (get_written == 0xFFFFFFFFu || get_now != get_written)
                         nv2a_pb_resync(get_now);
-                    if (put != last_put)
+                    if (put != last_put) {
+                        /* Executor load, logged every 5 s: the share of wall
+                         * time spent executing pushbuffer commands. Near 100%
+                         * means the "GPU" is the frame-rate limit. */
+                        static LARGE_INTEGER f, t_last;
+                        static LONGLONG busy;
+                        LARGE_INTEGER a, b;
+                        if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t_last); }
+                        QueryPerformanceCounter(&a);
                         nv2a_pb_scan(put);
+                        QueryPerformanceCounter(&b);
+                        busy += b.QuadPart - a.QuadPart;
+                        if (b.QuadPart - t_last.QuadPart > 5 * f.QuadPart) {
+                            fprintf(stderr, "[PB] executor busy %.0f%%\n",
+                                    100.0 * busy / (double)(b.QuadPart - t_last.QuadPart));
+                            busy = 0;
+                            t_last = b;
+                        }
+                    }
                     /* Consumed: now the space before PUT may be reused. */
                     *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) = put;
                     get_written = put;

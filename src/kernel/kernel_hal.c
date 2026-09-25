@@ -120,8 +120,11 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
+    /* Precise: GetSystemTimeAsFileTime moves only once per system tick (up to
+     * 15.6 ms); a frame loop pacing itself on this rounds every frame up to
+     * whole ticks. */
     if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+        GetSystemTimePreciseAsFileTime((LPFILETIME)CurrentTime);
 }
 
 /* ============================================================================

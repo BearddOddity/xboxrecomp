@@ -45,13 +45,18 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
+ * pushbuffer word, so a linear search here was the executor's largest cost
+ * (about 40% of its thread in one title's levels). */
+static uint16_t s_seen_slot[8][0x2000 / 4];
+
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+
+    if (*slot) {
+        s_seen[*slot - 1].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -69,6 +74,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        *slot = (uint16_t)s_seen_count;
     }
 }
 
