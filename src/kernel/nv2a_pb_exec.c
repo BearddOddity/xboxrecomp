@@ -34,6 +34,7 @@
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_backend.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -590,6 +591,52 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+/* ── Render back end (nv2a_backend.h) ───────────────────────── */
+
+static const Nv2aBackend *s_backend;
+
+void nv2a_backend_register(const Nv2aBackend *backend)
+{
+    s_backend = backend;
+}
+
+static void current_surface(Nv2aSurface *out)
+{
+    out->color_va        = dma_resolve(s_gpu.color_offset);
+    out->width           = s_gpu.clip_w;
+    out->height          = s_gpu.clip_h;
+    out->pitch           = s_gpu.pitch;
+    out->bytes_per_pixel = surface_bpp();
+    out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
+    out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+}
+
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+
+int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+{
+    Texture saved = s_gpu.tex;
+    uint32_t x, y;
+    int ok = 1;
+
+    s_gpu.tex.offset = tex->offset;
+    s_gpu.tex.width  = tex->width;
+    s_gpu.tex.height = tex->height;
+    s_gpu.tex.pitch  = tex->pitch;
+    s_gpu.tex.color  = tex->color;
+    s_gpu.tex.addr_u = 3;
+    s_gpu.tex.addr_v = 3;
+    s_gpu.tex.valid  = 1;
+    for (y = 0; y < tex->height && ok; y++)
+        for (x = 0; x < tex->width; x++)
+            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
+                ok = 0;
+                break;
+            }
+    s_gpu.tex = saved;
+    return ok;
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -600,6 +647,13 @@ static void clear_surface(uint32_t param)
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+    if (s_backend && s_backend->clear) {
+        Nv2aSurface surf;
+        current_surface(&surf);
+        s_backend->clear(&surf, s_gpu.clear_color, 0, 0, surf.width, surf.height);
+        s_gpu.clears++;
+        return;
+    }
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
@@ -1265,6 +1319,95 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* Hand the batch to the registered back end as a triangle list, using the
+ * same topology rules as the CPU path below. */
+#define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
+static Nv2aVertex s_bverts[NV_BACKEND_MAX_VERTS];
+
+static int backend_vertex(uint32_t index, Nv2aVertex *out)
+{
+    float p[4], uv[2];
+
+    if (!fetch_position(index, p))
+        return 0;
+    out->x = p[0];
+    out->y = p[1];
+    out->z = p[2];
+    out->rhw = p[3];
+    out->diffuse = vertex_color(index);
+    if (fetch_texcoord(index, uv)) {
+        out->u = uv[0];
+        out->v = uv[1];
+    } else {
+        out->u = out->v = 0.0f;
+    }
+    return 1;
+}
+
+static void backend_tri(uint32_t *n, uint32_t i0, uint32_t i1, uint32_t i2)
+{
+    if (*n + 3 > NV_BACKEND_MAX_VERTS)
+        return;
+    if (backend_vertex(i0, &s_bverts[*n])
+     && backend_vertex(i1, &s_bverts[*n + 1])
+     && backend_vertex(i2, &s_bverts[*n + 2]))
+        *n += 3;
+}
+
+static void backend_batch(void)
+{
+    Nv2aSurface surf;
+    Nv2aTexture tex;
+    Nv2aBatch batch;
+    uint32_t i, n = 0;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
+            backend_tri(&n, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        /* Alternate the winding so every strip triangle faces the same way. */
+        for (i = 0; i + 2 < s_gpu.idx_count; i++) {
+            if (i & 1)
+                backend_tri(&n, s_gpu.idx[i + 1], s_gpu.idx[i], s_gpu.idx[i + 2]);
+            else
+                backend_tri(&n, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 2]);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_QUADS:
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 1; i + 1 < s_gpu.idx_count; i++)
+            backend_tri(&n, s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i + 1]);
+        break;
+    default:
+        return;                             /* points and lines: not yet */
+    }
+    if (!n)
+        return;
+
+    current_surface(&surf);
+    batch.vertices = s_bverts;
+    batch.count = n;
+    batch.texture = NULL;
+    {
+        const VertexAttr *tc = texcoord_attr();
+        if (s_gpu.tex.valid && tc->offset && tc->stride) {
+            tex.offset = s_gpu.tex.offset;
+            tex.width  = s_gpu.tex.width;
+            tex.height = s_gpu.tex.height;
+            tex.pitch  = s_gpu.tex.pitch;
+            tex.color  = s_gpu.tex.color;
+            tex.addr_u = s_gpu.tex.addr_u;
+            tex.addr_v = s_gpu.tex.addr_v;
+            batch.texture = &tex;
+        }
+    }
+    s_backend->draw(&surf, &batch);
+    s_gpu.tris_drawn += n / 3;
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -1274,6 +1417,14 @@ static void raster_batch(void)
         return;
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
+        return;
+    }
+    if (s_backend && s_backend->draw) {
+        if (batch_is_ffp())
+            s_gpu.batches_ffp++;
+        backend_batch();
+        s_gpu.drawn_offset = s_gpu.color_offset;
+        s_gpu.drawn_pitch = s_gpu.pitch;
         return;
     }
     if (batch_is_ffp()) {
@@ -1813,6 +1964,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowSet(dma_resolve(s_gpu.drawn_offset),
                                       s_gpu.drawn_pitch);
         }
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
