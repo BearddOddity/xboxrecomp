@@ -2724,6 +2724,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
 
+    /* XDK D3D's KickOff (TC:NY 0x002BCB10) ends every kick with method 0x0310
+     * on subchannel 5, and reads the value back from PGRAPH 0x400B10 once the
+     * GPU has passed it:
+     *
+     *     ((pushbuffer_address * 8 | (fence & 0x1F)) << 2) | (wrap & 3)
+     *
+     * That is how D3D knows where the GPU is reading. Unmodelled, 0x400B10
+     * read 0: BlockOnTime spun until the semaphore was a multiple of 32, and
+     * took the GPU to be far behind, patched its "signal me" NOP into
+     * commands already executed and slept on an event nothing would set --
+     * TC:NY froze at its menu. Latch it when the executor reaches it, which
+     * is when the GPU would. */
+    if (method == 0x0310 && subch == 5) {
+        NV2A_REG(0x400B10) = param;
+        return;
+    }
+
     s_reg[(method & 0x1FFCu) / 4] = param;
     if (pb_verbose() && (method == 0x17C4 || (method >= 0x0C00 && method < 0x0C24))) {
         static int shown;
