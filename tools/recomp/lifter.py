@@ -407,8 +407,22 @@ _FLAGS_UNDEFINED = frozenset({
     "popfd",
 })
 
+# Scalar single-precision compares (CMPSS with its predicate folded into the
+# mnemonic, as capstone prints it) -> C test producing the lane-0 mask.
+_SCALAR_CMP_SS = {
+    "cmpeqss":    "{a} == {b}",
+    "cmpltss":    "{a} < {b}",
+    "cmpless":    "{a} <= {b}",
+    "cmpunordss": "{a} != {a} || {b} != {b}",
+    "cmpneqss":   "!({a} == {b})",
+    "cmpnltss":   "!({a} < {b})",
+    "cmpnless":   "!({a} <= {b})",
+    "cmpordss":   "{a} == {a} && {b} == {b}",
+}
+
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
 _EFLAGS_PRESERVE = frozenset({
+    *_SCALAR_CMP_SS,
     # General-purpose data movement / stack
     "mov", "lea", "push", "pop", "nop", "leave", "ret",
     "movzx", "movsx", "xchg", "bswap",
@@ -1532,7 +1546,8 @@ class Lifter:
                  "sqrtps", "rsqrtps", "rcpps",
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
                  "movmskps",
-                 "pand", "pandn", "por", "pxor", "pcmpgtd"):
+                 "pand", "pandn", "por", "pxor", "pcmpgtd") \
+                or m in _SCALAR_CMP_SS:
             return self._lift_sse(insn, m, ops)
 
         # ── FPU ──
@@ -3100,6 +3115,18 @@ class Lifter:
             if lifted is not None:
                 return lifted
             return [f"/* {m} {insn.op_str} */"]
+
+        # ── Scalar comparison ──
+        # cmpXXss writes an all-ones or all-zero mask into lane 0 and leaves
+        # lanes 1-3 alone. The mask is then and'ed/andn'ed into a branchless
+        # select, so emitting these as comments left the select reading a stale
+        # lane -- clamps and min/max idioms quietly picked the wrong side.
+        # EQ/LT/LE/ORD are false on NaN; NEQ/NLT/NLE/UNORD are true on NaN,
+        # which is exactly what the negated C comparisons give.
+        if m in _SCALAR_CMP_SS and nops >= 2 and _is_xmm(ops[0]):
+            a, b = _sse_read(ops[0]), _sse_read(ops[1])
+            test = _SCALAR_CMP_SS[m].format(a=a, b=b)
+            return [f"{ops[0].reg}.u[0] = ({test}) ? 0xFFFFFFFFu : 0u; /* {m} */"]
 
         # ── Move mask ──
         # This feeds branches, so a hardcoded 0 silently picked one side.
