@@ -2392,6 +2392,41 @@ class Lifter:
             targets.append(val)
         return targets
 
+    def _read_local_table(self, table_va, max_entries=256):
+        """Arms of a switch table, read in both directions from its base and
+        kept only while they land inside this function.
+
+        MSVC indexes some tables from 1 (entry 0 is filler) and some with a
+        negated register, so the arms sit below the base. memcpy/memmove use
+        both; reading forward from entry 0 found no arms for either, and each
+        dispatch lifted as an unresolvable indirect tail jump -- every copy
+        that reached a tail case never finished.
+        """
+        if not self.xbe_data:
+            return []
+
+        def entry(i):
+            offset = va_to_file_offset(table_va + i * 4)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                return None
+            val = struct.unpack_from('<I', self.xbe_data, offset)[0]
+            return val if self.func_start <= val < self.func_end else None
+
+        def run(first, step):
+            out = []
+            i = first
+            while len(out) < max_entries:
+                t = entry(i)
+                if t is None:
+                    break
+                out.append(t)
+                i += step
+            return out
+
+        forward = run(0, 1) or run(1, 1)
+        backward = run(-1, -1)
+        return backward[::-1] + forward
+
     def _analyze_switch_table(self, ops):
         """Detect if an indirect jmp operand is an intra-function switch table.
         Pattern: jmp [reg*scale + table_base] or jmp [reg + table_base]
@@ -2406,7 +2441,7 @@ class Lifter:
         table_va = op.mem_disp
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
-            targets = self._read_jump_table(table_va)
+            targets = self._read_local_table(table_va)
         if not targets:
             return []
         # Truncate at the first entry outside the function rather than
@@ -2584,7 +2619,8 @@ class Lifter:
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (RECOMP_RAM_SPAN(esi, _n) && RECOMP_RAM_SPAN(edi, _n) &&"
+                    " (_d + _n <= _s || _s + _n <= _d)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
@@ -2593,7 +2629,8 @@ class Lifter:
         if "movsd" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (RECOMP_RAM_SPAN(esi, _n) && RECOMP_RAM_SPAN(edi, _n) &&"
+                    " (_d + _n <= _s || _s + _n <= _d)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
                     "  esi += ecx * 4; edi += ecx * 4; }",
@@ -2603,7 +2640,8 @@ class Lifter:
         if "movsw" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (RECOMP_RAM_SPAN(esi, _n) && RECOMP_RAM_SPAN(edi, _n) &&"
+                    " (_d + _n <= _s || _s + _n <= _d)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
                     "  esi += ecx * 2; edi += ecx * 2; }",
@@ -2611,7 +2649,8 @@ class Lifter:
                     " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
                     "ecx = 0; /* rep movsw */"]
         if "stosb" in m:
-            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+            return ["if (!g_df && RECOMP_RAM_SPAN(edi, ecx)) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                    "else if (!g_df) { uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM8(edi + _i) = LO8(eax); edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
                     "ecx = 0; /* rep stosb */"]

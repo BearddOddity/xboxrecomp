@@ -378,6 +378,15 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/** True when [va, va + n) is plain memory: below the device apertures (NV2A
+ *  at 0xFD000000, APU/MCPX at 0xFE800000, flash at 0xFF000000) and not
+ *  wrapping. Block copies take memcpy/memset only then. A device read inside
+ *  memcpy faults in the C runtime, where the MMIO trap cannot decode it;
+ *  element by element through MEM32 it faults in generated code and is
+ *  emulated. DirectSound copying DSP memory with rep movsd hit exactly that. */
+#define RECOMP_RAM_SPAN(va, n) \
+    ((uint64_t)(uint32_t)(va) + (uint64_t)(n) <= 0xFD000000ull)
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))

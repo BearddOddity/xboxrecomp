@@ -6,6 +6,7 @@ with instruction classification and operand analysis.
 """
 
 import bisect
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -94,6 +95,9 @@ class DisasmEngine:
         # Populated by resync_jump_tables() from the indexed indirect jumps
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
+        # Dispatch base -> (first, end) of its table's bytes. Differs from the
+        # jump_tables key only for negated-index tables, which sit below it.
+        self._jt_ranges: Dict[int, tuple] = {}
         self._jt_candidates: Set[int] = set()
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
@@ -256,6 +260,7 @@ class DisasmEngine:
         Returns the number of tables resynced.
         """
         resynced = 0
+        negated = self._negated_index_tables()
         for tbl in sorted(self._jt_candidates):
             # XBEs mark .rdata and .data executable, so "points at an
             # executable section" alone would let an array of data pointers
@@ -273,32 +278,89 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
-            if entries < min_entries:
+
+            # `neg reg; jmp [reg*4 + tbl]` indexes the table with 0, -1, -2,
+            # ..., so its entries lie BELOW tbl. MSVC's memmove does this for
+            # its backward tail copy: the table at tbl has one entry above it
+            # and seven below, so the forward count alone never reached
+            # min_entries, the table was left as "code", and the sweep ran out
+            # of phase through the tail cases and the epilogue after it. The
+            # function ended inside the table, and every copy that took a
+            # tail case became an unresolvable indirect call.
+            #
+            # Only walked for that exact pattern, and never back past the
+            # dispatching jump: words just before an ordinary table are code,
+            # and some of them look like pointers.
+            below = 0
+            floor = negated.get(tbl)
+            if floor is not None:
+                while below < max_entries:
+                    va = tbl - (below + 1) * 4
+                    if va < floor:
+                        break
+                    target = self.image.read_u32_at_va(va)
+                    if target is None or not (lo <= target < hi):
+                        break
+                    below += 1
+
+            if entries + below < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
                 continue
 
+            start = tbl - below * 4
             end = tbl + entries * 4
             for insn in self.get_instructions_in_range(
-                    tbl - 16, end):
-                if insn.end_address > tbl and insn.address < end:
+                    start - 16, end):
+                if insn.end_address > start and insn.address < end:
                     del self.instructions[insn.address]
             self._sorted_addrs = None
 
-            self.jump_tables[tbl] = end
+            # Keyed by where the table's bytes start: that is the address a
+            # walk along the fall-through path arrives at.
+            self.jump_tables[start] = end
+            self._jt_ranges[tbl] = (start, end)
             self.decode_at(end)
             resynced += 1
 
         return resynced
 
     def jump_table_entries(self, tbl: int) -> List[int]:
-        """Code pointers held by a resynced jump table, or [] if unknown."""
-        end = self.jump_tables.get(tbl)
-        if end is None:
+        """Code pointers held by a resynced jump table, or [] if unknown.
+
+        `tbl` is the dispatch's base; a negated-index table extends below it,
+        so the range recorded at resync time is used, not tbl itself."""
+        start, end = self._jt_ranges.get(tbl, (None, None))
+        if start is None:
             return []
         return [self.image.read_u32_at_va(a) or 0
-                for a in range(tbl, end, 4)]
+                for a in range(start, end, 4)]
+
+    def _negated_index_tables(self) -> Dict[int, int]:
+        """Table bases dispatched as `neg reg; jmp [reg*4 + tbl]`.
+
+        -> {tbl: lowest VA the table may extend down to}, which is the end of
+        the dispatching jump: a table is never above its own dispatch."""
+        found: Dict[int, int] = {}
+        self._ensure_sorted_addrs()
+        addrs = self._sorted_addrs
+        for insn in self.instructions.values():
+            if insn.jump_table is None:
+                continue
+            m = re.search(r"\[(\w+)\*4", insn.op_str)
+            if not m:
+                continue
+            i = bisect.bisect_left(addrs, insn.address)
+            if i == 0:
+                continue
+            prev = self.instructions[addrs[i - 1]]
+            if (prev.end_address == insn.address and prev.mnemonic == "neg"
+                    and prev.op_str.strip() == m.group(1)):
+                floor = insn.end_address
+                found[insn.jump_table] = max(found.get(insn.jump_table, 0),
+                                             floor)
+        return found
 
     def decode_at(self, addr: int, max_insns: int = 4096) -> int:
         """

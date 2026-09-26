@@ -604,7 +604,10 @@ class FunctionTranslator:
             return targets
 
         backward = scan(-1, 1)
-        forward = scan(1, 0)
+        # MSVC indexes some tables from 1 and leaves entry 0 as filler
+        # (memcpy's trailing-bytes table), so a table whose entry 0 is not a
+        # local code address may still start at entry 1.
+        forward = scan(1, 0) or scan(1, 1)
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
@@ -695,6 +698,34 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
+    def _redecode_past_tables(self, start, end, instructions):
+        """Control-flow decode when a switch arm is not a decoded boundary.
+
+        Returns the new instruction list (and sets the lifter's table map), or
+        None when the linear decode already had every arm."""
+        boundaries = {insn.address for insn in instructions}
+        indexed = [insn for insn in instructions
+                   if insn.is_jump and insn.jump_target is None
+                   and insn.operands and insn.operands[0].type == "mem"
+                   and insn.operands[0].mem_index
+                   and not insn.operands[0].mem_base]
+        missing = False
+        for insn in indexed:
+            arms = self._read_local_jump_table(
+                insn.operands[0].mem_disp, start, end)
+            if any(t not in boundaries for t in arms):
+                missing = True
+                break
+        if not missing:
+            return None
+        stop = {a for a in self.func_db if start < a < end}
+        recovered = self._recover_cfg(start, end, set(), stop)
+        if recovered is None:
+            return None
+        cfg_insns, jump_tables, _ = recovered
+        self.lifter.jump_table_targets = jump_tables
+        return cfg_insns
+
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
@@ -719,6 +750,20 @@ class FunctionTranslator:
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
+
+        # A linear decode runs straight through an embedded switch table and
+        # comes out of phase, so the table's arms are not instruction
+        # boundaries and get no labels: the dispatch then compiles to
+        # "(void)0; /* label not in function */" and the case is dead. MSVC's
+        # memcpy has seven such tables. Where an arm misses, decode by control
+        # flow instead -- the same decoder the split-entry path uses, which
+        # starts at the entry and each arm and never walks into table data.
+        cfg_decoded = False
+        if not recovered:
+            redecoded = self._redecode_past_tables(start, end, instructions)
+            if redecoded is not None:
+                instructions = redecoded
+                cfg_decoded = True
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -758,7 +803,7 @@ class FunctionTranslator:
         # the code it points at: decoding the table as instructions leaves the
         # stream misaligned across the first case. Re-decode, telling the
         # disassembler where the real instruction boundaries are.
-        if recovered is None:
+        if recovered is None and not cfg_decoded:
             missing = switch_leaders - {insn.address for insn in instructions}
             if missing:
                 instructions = self.disasm.disassemble_function(
