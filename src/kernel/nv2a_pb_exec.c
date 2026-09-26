@@ -2632,11 +2632,20 @@ static void pgraph_trap_nop(uint32_t subch, uint32_t param)
     for (;;) {
         if (!(NV2A_REG(0x400100) & 0x00100000u))
             break;
+        /* The vblank interrupt shares the GPU vector. Handling it can leave
+         * PMC_INTR with only the PCRTC bit (TC:NY's menu: "PMC_INTR 1000000
+         * EN 0" on the one BlockOnTime wake-up, software method 5, that was
+         * never delivered, out of 189). The trap is still pending, so say so
+         * again rather than let it be lost. */
+        if (!(NV2A_REG(0x000100) & 0x00001000u)) {
+            NV2A_REG(0x000100) |= 0x00001000u;
+            xbox_set_irq_line(3, 1);
+        }
         QueryPerformanceCounter(&now);
-        if ((now.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 100) {
+        if ((now.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 1000) {
             if (timeouts++ < 5)
                 fprintf(stderr, "  [GPU] software method 0x%08X: no handler "
-                                "after 100 ms (FIFO %X PMC_INTR %X EN %X "
+                                "after 1 s (FIFO %X PMC_INTR %X EN %X "
                                 "PGRAPH_INTR %X)\n", param,
                         NV2A_REG(0x400720), NV2A_REG(0x000100),
                         NV2A_REG(0x000140), NV2A_REG(0x400100));
