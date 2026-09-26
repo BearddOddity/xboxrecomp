@@ -130,6 +130,18 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (addr == NV_PAPU_SECTL && getenv("RECOMP_APU_SECTL_TRACE")) {
+            static int lines;
+            static LARGE_INTEGER f, t0;
+            LARGE_INTEGER now;
+            if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+            QueryPerformanceCounter(&now);
+            if (lines++ < 300)
+                fprintf(stderr, "[SECTL] %9.3f ms %08X -> %08X (thread %lu)\n",
+                        (now.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart,
+                        qatomic_read(&d->regs[addr]), (uint32_t)val,
+                        GetCurrentThreadId());
+        }
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -498,6 +510,13 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        {   /* RECOMP_APU_TRACE: why frames are silent (see apu_vp_trace_second) */
+            extern int g_apu_tr_full, g_apu_tr_trapped, g_apu_tr_halted, g_apu_tr_off;
+            if (apu_active) g_apu_tr_full++;
+            else if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) g_apu_tr_off++;
+            else if (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) g_apu_tr_trapped++;
+            else g_apu_tr_halted++;
+        }
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);

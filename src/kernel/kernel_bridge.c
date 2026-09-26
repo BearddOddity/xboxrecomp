@@ -2264,26 +2264,109 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* When the next vblank is due, in QueryPerformanceCounter ticks; 0 = none
+ * scheduled. The timer thread sleeps no longer than until then.
+ *
+ * A drift-free 60 Hz schedule on QPC. This was "GetTickCount64() + 16",
+ * and GetTickCount64 moves in 15.6 ms steps, so the next check that could
+ * pass came two steps later: 31 ms, 32 vblanks a second. XDK D3D counts
+ * vblanks to decide when a queued swap is shown, so a title at "60 Hz"
+ * presented at 30 and its frame pacer ran at half speed. */
+static long long g_vblank_next_qpc;
+static long long g_qpc_freq;
+
+/* The PTIMER alarm (see g_nv2a_ptimer_latch in xbox_memory_layout.c, which
+ * also runs the clock). Raised when TIME_0 passes ALARM_0 with the interrupt
+ * enabled, once per alarm value, and not again until acknowledged. */
+#define NV2A_PTIMER_INTR     0x00009100u
+#define NV2A_PTIMER_INTR_EN  0x00009140u
+#define NV2A_PTIMER_TIME_0   0x00009400u
+#define NV2A_PTIMER_ALARM_0  0x00009420u
+#define NV2A_PMC_INTR_PTIMER (1u << 20)
+
+static void kernel_ptimer_tick(void)
+{
+    extern volatile LONG g_nv2a_ptimer_latch;
+    static int enabled = -1;
+    static uint32_t fired;
+    uint32_t alarm, now;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_VBLANK") && strcmp(getenv("RECOMP_VBLANK"), "0");
+    if (!enabled || g_nv2a_ptimer_latch)
+        return;
+    if (!(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_INTR_EN) & 1))
+        return;
+    alarm = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_ALARM_0);
+    now   = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_TIME_0);
+    if (alarm == fired || (int32_t)(now - alarm) < 0)
+        return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+    fired = alarm;
+    InterlockedExchange(&g_nv2a_ptimer_latch, 1);
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_INTR) = 0x80000001u;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) |= NV2A_PMC_INTR_PTIMER;
+    kernel_raise_interrupt(NV2A_VECTOR);
+}
+
+static DWORD kernel_vblank_wait_ms(DWORD cap)
+{
+    LARGE_INTEGER now;
+    long long ms;
+
+    /* An armed PTIMER alarm: wake for it too. */
+    if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_INTR_EN) & 1) {
+        int32_t left = (int32_t)(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_ALARM_0)
+                                 - BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PTIMER_TIME_0));
+        DWORD a = left <= 0 ? 0 : (DWORD)(left / 1000000);
+        if (a < cap)
+            cap = a;
+    }
+    if (!g_vblank_next_qpc)
+        return cap;
+    QueryPerformanceCounter(&now);
+    ms = (g_vblank_next_qpc - now.QuadPart) * 1000 / g_qpc_freq;
+    return ms <= 0 ? 0 : ms < (long long)cap ? (DWORD)ms : cap;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    LARGE_INTEGER now;
+    long long period;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") && strcmp(getenv("RECOMP_VBLANK"), "0");
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    if (!g_qpc_freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_qpc_freq = f.QuadPart;
+    }
+    period = g_qpc_freq / 60;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < g_vblank_next_qpc)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    /* One vblank per tick. Fell more than a frame behind (a long DPC, a
+     * debugger): restart the schedule rather than deliver a burst. */
+    g_vblank_next_qpc = (g_vblank_next_qpc && now.QuadPart - g_vblank_next_qpc < period)
+                      ? g_vblank_next_qpc + period
+                      : now.QuadPart + period;
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    /* Latched until the title acknowledges it; see g_nv2a_vblank_latch in
+     * xbox_memory_layout.c. The marker is PCRTC_INTR's vblank bit plus bit
+     * 31, so the title's write-1-to-clear is visible as a change. */
+    {
+        extern volatile LONG g_nv2a_vblank_latch;
+        InterlockedExchange(&g_nv2a_vblank_latch, 1);
+    }
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) = 0x80000000u | NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
@@ -2294,6 +2377,22 @@ static void kernel_vblank_tick(void)
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+        {   /* RECOMP_FPS: vblanks raised and claimed per second */
+            static int fps = -1, raised, took;
+            static ULONGLONG next;
+            if (fps < 0) fps = getenv("RECOMP_FPS") != NULL;
+            if (fps) {
+                raised++;
+                took += claimed > 0;
+                if (GetTickCount64() >= next) {
+                    if (next)
+                        fprintf(stderr, "  [NV2A] vblanks/s raised %d claimed %d\n",
+                                raised, took);
+                    raised = took = 0;
+                    next = GetTickCount64() + 1000;
+                }
+            }
+        }
     }
 }
 
@@ -2582,6 +2681,9 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2612,17 +2714,23 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    /* 1 ms scheduler granularity for this process: at the default 15.6 ms a
+     * 10 ms wait sleeps 15.6, and the vblank below cannot keep 60 Hz. */
+    timeBeginPeriod(1);
+
     for (;;) {
         long long now;
         int i;
 
-        WaitForSingleObject(irq_event(), 10);   /* a device interrupt, or 10 ms */
+        /* A device interrupt, the next vblank, or 10 ms, whichever is first. */
+        WaitForSingleObject(irq_event(), kernel_vblank_wait_ms(10));
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */
         pending_start_flush(0); /* threads whose creator made no further call */
         xbox_KfRaiseIrql(DISPATCH_LEVEL);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_ptimer_tick();  /* the GPU timer's alarm */
         kernel_service_irqs(); /* device interrupts; their DPCs drain below */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();

@@ -748,11 +748,123 @@ static void framebuffer_probe_tick(void)
 static int s_exec_busy_pct;
 int nv2a_exec_busy_percent(void) { return s_exec_busy_pct; }
 
+/* Set while the pushbuffer executor has raised a real PGRAPH interrupt (a
+ * trapped software method, nv2a_pb_exec.c) and is waiting for the title's
+ * handler: PMC_INTR and PGRAPH_INTR then hold a genuine pending bit, and
+ * zeroing them here would take it away before the handler looks. */
+volatile LONG g_nv2a_intr_hold;
+
+/*
+ * A vertical blank stays pending until the title acknowledges it.
+ *
+ * The vblank tick (kernel_bridge.c) raises PCRTC_INTR and PMC_INTR and calls
+ * the ISR, which queues a DPC; the DPC reads PMC_INTR to see what happened.
+ * This thread zeroes both registers in a tight loop, so most of the time it
+ * got there first and the DPC found nothing: D3D's vblank handler ran about 8
+ * times a second instead of 60. D3D queues each swap for a vblank *count*, so
+ * with the count crawling, queued swaps fell hundreds of vblanks into the
+ * future and never completed -- no D3DVBLANK_SWAPDONE, and a title pacing on
+ * it waited out a one-second timeout every frame.
+ *
+ * So the tick writes a marker into PCRTC_INTR and sets the latch. The title
+ * acknowledges by writing 1 (write-1-to-clear on hardware); a value other
+ * than the marker is that write, and only then are the two bits cleared, as
+ * the hardware would. The DPC's own acknowledge loop (write PCRTC_INTR, wait
+ * for the PMC_INTR bit to drop) finishes through the same path.
+ */
+volatile LONG g_nv2a_vblank_latch;
+#define NV2A_VBLANK_PENDING 0x80000001u
+
+static void nv2a_vblank_ack(volatile uint32_t *regs)
+{
+    volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
+    volatile uint32_t *pmc   = (volatile uint32_t *)((char *)regs + 0x000100);
+
+    if (!g_nv2a_vblank_latch || *pcrtc == NV2A_VBLANK_PENDING)
+        return;
+    *pcrtc = 0;
+    *pmc &= ~0x01000000u;
+    InterlockedExchange(&g_nv2a_vblank_latch, 0);
+}
+
+/* PGRAPH_INCREMENT (0x40071C) bit 1, READ_3D: the title's vblank handler sets
+ * it when it has put a swapped buffer on screen, and on hardware that
+ * advances PGRAPH's flip read index -- which is what ends a FLIP_STALL. The
+ * pushbuffer executor keeps the index; this counts the writes for it. */
+volatile LONG g_nv2a_flip_read_incs;
+
+static void nv2a_flip_increments(volatile uint32_t *regs)
+{
+    volatile uint32_t *inc = (volatile uint32_t *)((char *)regs + 0x40071C);
+
+    if (*inc & 2u) {
+        *inc &= ~2u;
+        InterlockedIncrement(&g_nv2a_flip_read_incs);
+    }
+}
+
+/*
+ * PTIMER: the GPU's nanosecond clock and its alarm.
+ *
+ * XDK D3D does not always take its vertical blank from the CRTC. In some
+ * display modes it programs a PTIMER alarm one refresh period ahead
+ * (16,683,350 ns at 59.94 Hz), handles the PTIMER interrupt as its vblank, and
+ * only acknowledges the CRTC one. Nothing here ran the clock, so the alarm
+ * never came and D3D's vblank work (showing queued swaps, the title's vblank
+ * callback) happened only when some other path polled for it.
+ *
+ * This thread keeps TIME_0/TIME_1 (0x9400/0x9410) running from the host's
+ * counter; the timer thread (kernel_bridge.c) raises the interrupt when the
+ * clock passes ALARM_0 (0x9420). The pending bit in PTIMER_INTR (0x9100) is
+ * written as a marker so the title's write-1-to-clear shows as a change,
+ * exactly as for the vblank above. Writes the title makes to TIME are not
+ * honoured: the clock is free-running from process start.
+ */
+volatile LONG g_nv2a_ptimer_latch;
+#define NV2A_PTIMER_PENDING 0x80000001u
+
+static void nv2a_ptimer(volatile uint32_t *regs)
+{
+    static LARGE_INTEGER f, t0;
+    LARGE_INTEGER now;
+    uint64_t ns;
+    volatile uint32_t *intr = (volatile uint32_t *)((char *)regs + 0x9100);
+    volatile uint32_t *pmc  = (volatile uint32_t *)((char *)regs + 0x000100);
+
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+    }
+    QueryPerformanceCounter(&now);
+    ns = (uint64_t)(now.QuadPart - t0.QuadPart) / (uint64_t)f.QuadPart * 1000000000ull
+       + (uint64_t)(now.QuadPart - t0.QuadPart) % (uint64_t)f.QuadPart
+         * 1000000000ull / (uint64_t)f.QuadPart;
+    *(volatile uint32_t *)((char *)regs + 0x9410) = (uint32_t)(ns >> 32);
+    *(volatile uint32_t *)((char *)regs + 0x9400) = (uint32_t)ns & ~0x1Fu;
+
+    if (g_nv2a_ptimer_latch && *intr != NV2A_PTIMER_PENDING) {
+        *intr = 0;
+        *pmc &= ~0x00100000u;
+        InterlockedExchange(&g_nv2a_ptimer_latch, 0);
+    }
+}
+
 static void nv2a_ack_flags(volatile uint32_t *regs)
 {
+    nv2a_vblank_ack(regs);
+    nv2a_ptimer(regs);
+    nv2a_flip_increments(regs);
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        if (g_nv2a_intr_hold && (NV2A_ACK[i].offset == 0x000100
+                                 || NV2A_ACK[i].offset == 0x400100))
+            continue;
+        if (g_nv2a_vblank_latch && (NV2A_ACK[i].offset == 0x000100
+                                    || NV2A_ACK[i].offset == 0x600100))
+            continue;
+        if (g_nv2a_ptimer_latch && NV2A_ACK[i].offset == 0x000100)
+            continue;
         if (*r & NV2A_ACK[i].busy_mask) {
             *r &= ~NV2A_ACK[i].busy_mask;
         }

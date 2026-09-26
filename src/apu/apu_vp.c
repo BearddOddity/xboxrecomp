@@ -185,6 +185,27 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* RECOMP_APU_SSL_TRACE=<voice>: time each hand-off of one stream voice's
+ * two segment lists (the driver sets one, the voice finishes one, the voice
+ * finds the next one empty). The gap between "done" and the next "set" is how
+ * long the driver took to refill; a "starved" line is a gap you can hear. */
+static void ssl_trace(int v, const char *what, uint32_t arg)
+{
+    static int want = -2, lines;
+    static LARGE_INTEGER f, t0;
+    LARGE_INTEGER now;
+    if (want == -2) {
+        const char *e = getenv("RECOMP_APU_SSL_TRACE");
+        want = e ? (int)strtol(e, NULL, 0) : -1;
+    }
+    if (want < 0 || v != want || lines >= 400) return;
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    QueryPerformanceCounter(&now);
+    lines++;
+    fprintf(stderr, "[SSL] %9.2f ms v%03X %-9s %08X\n",
+            (now.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart, v, what, arg);
+}
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -458,6 +479,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 0;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        ssl_trace(current_voice, "set A", argument);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -468,6 +490,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 1;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        ssl_trace(current_voice, "set B", argument);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -805,6 +828,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            ssl_trace(v, ssl_index ? "starved B" : "starved A", 0);
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -931,6 +955,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                ssl_trace(v, ssl_index ? "done B" : "done A",
+                          (uint32_t)d->vp.ssl[v].count[next_index]);
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1035,7 +1061,11 @@ static void voice_process(MCPXAPUState *d,
     dbg->stereo = stereo;
     dbg->paused = paused;
 
-    if (paused) return;
+    if (paused) {
+        extern void apu_vp_trace_paused(uint16_t v);
+        apu_vp_trace_paused(v);
+        return;
+    }
 
     /* Step filter envelope */
     float ef_value = voice_step_envelope(
@@ -1094,7 +1124,11 @@ static void voice_process(MCPXAPUState *d,
              * nothing to give (paused, or a persistent stream with no packet
              * queued), and retrying spun here forever holding the APU lock --
              * which froze DirectSound's next register write, and the game. */
-            if (count <= 0) break;
+            if (count <= 0) {
+                extern void apu_vp_trace_short(uint16_t v, int got);
+                apu_vp_trace_short(v, sample_count);
+                break;
+            }
             sample_count += count;
         }
     }
@@ -1237,6 +1271,13 @@ static float g_vp_mix_peak;
 /* RECOMP_APU_TRACE: once a second, how many voices were unpaused and how many
  * fetched non-silent samples, with the registers of one of each kind. */
 static int   g_tr_on = -1, g_tr_unpaused, g_tr_sounding;
+static struct { int frames, sounding, shorts, paused; float peak; } g_tr_voice[MCPX_HW_MAX_VOICES];
+static int g_tr_empty_frames;
+
+void apu_vp_trace_paused(uint16_t v)
+{
+    if (g_tr_on > 0) g_tr_voice[v].paused++;
+}
 static char  g_tr_quiet[200], g_tr_loud[200];
 
 void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea)
@@ -1245,7 +1286,9 @@ void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea)
     if (g_tr_on < 0) g_tr_on = getenv("RECOMP_APU_TRACE") != NULL;
     if (!g_tr_on) return;
     g_tr_unpaused++;
-    if (peak > 0.0f) g_tr_sounding++;
+    g_tr_voice[v].frames++;
+    if (peak > 0.0f) { g_tr_sounding++; g_tr_voice[v].sounding++; }
+    if (peak > g_tr_voice[v].peak) g_tr_voice[v].peak = peak;
     dst = peak > 0.0f ? g_tr_loud : g_tr_quiet;
     if (*dst) return;
     snprintf(dst, sizeof g_tr_loud,
@@ -1260,14 +1303,44 @@ void apu_vp_trace_voice(MCPXAPUState *d, uint16_t v, float peak, float ea)
              voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO));
 }
 
+/* A voice that ran dry part-way through a frame: the rest of the frame is
+ * silence. A stream voice doing this every few frames is a gap you can hear. */
+static int g_tr_short, g_tr_short_v = -1, g_tr_short_got;
+int g_apu_tr_full, g_apu_tr_trapped, g_apu_tr_halted, g_apu_tr_off;
+
+void apu_vp_trace_short(uint16_t v, int got)
+{
+    if (g_tr_on <= 0) return;
+    g_tr_short++;
+    g_tr_voice[v].shorts++;
+    if (g_tr_short_v < 0) { g_tr_short_v = v; g_tr_short_got = got; }
+}
+
 static void apu_vp_trace_second(void)
 {
     static DWORD next;
     if (g_tr_on <= 0 || GetTickCount() < next) return;
     next = GetTickCount() + 1000;
     fprintf(stderr, "[APU-VP] unpaused %d sounding %d (voice-frames/s) mixpeak %.3f\n"
+                    "[APU-VP]   short frames %d (first v%03X after %d samples)\n"
                     "[APU-VP]   quiet: %s\n[APU-VP]   loud:  %s\n",
-            g_tr_unpaused, g_tr_sounding, g_vp_mix_peak, g_tr_quiet, g_tr_loud);
+            g_tr_unpaused, g_tr_sounding, g_vp_mix_peak,
+            g_tr_short, g_tr_short_v, g_tr_short_got, g_tr_quiet, g_tr_loud);
+    /* Every voice that ran this second: frames run, frames with sound, frames
+     * cut short, loudest sample. A playing voice runs 1500 frames a second. */
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        if (!g_tr_voice[v].frames && !g_tr_voice[v].paused) continue;
+        fprintf(stderr, "[APU-VP]   v%03X run %4d sound %4d short %3d peak %.3f paused %d\n", v,
+                g_tr_voice[v].frames, g_tr_voice[v].sounding,
+                g_tr_voice[v].shorts, g_tr_voice[v].peak, g_tr_voice[v].paused);
+    }
+    fprintf(stderr, "[APU-VP]   frames with no voice processed: %d\n", g_tr_empty_frames);
+    g_tr_empty_frames = 0;
+    memset(g_tr_voice, 0, sizeof g_tr_voice);
+    fprintf(stderr, "[APU-VP]   frames: full %d trapped %d halted %d off %d\n",
+            g_apu_tr_full, g_apu_tr_trapped, g_apu_tr_halted, g_apu_tr_off);
+    g_apu_tr_full = g_apu_tr_trapped = g_apu_tr_halted = g_apu_tr_off = 0;
+    g_tr_short = 0; g_tr_short_v = -1;
     g_tr_unpaused = g_tr_sounding = 0;
     g_tr_quiet[0] = g_tr_loud[0] = 0;
 }
@@ -1316,6 +1389,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     }
     if (g_vp_voices_now > g_vp_voices_max)
         g_vp_voices_max = g_vp_voices_now;
+    if (!g_vp_voices_now && g_tr_on > 0)
+        g_tr_empty_frames++;
     for (int b = 0; b < NUM_MIXBINS; b++)
         for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
             float a = fabsf(mixbins[b][s]);

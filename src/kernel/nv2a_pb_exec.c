@@ -2554,9 +2554,175 @@ static int capture_render_state(uint32_t method, uint32_t param)
     }
 }
 
+/*
+ * NO_OPERATION with a non-zero parameter: D3D's software methods.
+ *
+ * On hardware PGRAPH does not execute these. It stops, latches the method and
+ * its data in TRAPPED_ADDR / TRAPPED_DATA_LOW, raises PGRAPH_INTR, and waits
+ * for the driver. XDK D3D's graphics interrupt handler reads them back and, for
+ * method 0x100, hands the data to its software-method switch -- which is where
+ * a swap is queued for the next vertical blank. Nothing else queues it: with
+ * this method dropped, no swap ever completes, the vblank callback never sees
+ * D3DVBLANK_SWAPDONE, and a title that paces itself on that flag (one waits up
+ * to a second per frame for it) runs at one frame a second -- and so does
+ * every audio stream it refills from its frame loop.
+ *
+ * This runs on the ack thread, not a guest thread, so it can stall here the
+ * way the GPU does: raise the interrupt and wait until the trap is
+ * acknowledged. Bounded, because a handler that never runs must not stop the
+ * pushbuffer for good.
+ *
+ * Acknowledged means the ERROR bit in PGRAPH_INTR is clear again. On hardware
+ * the handler's own write clears it (write-1-to-clear); guest RAM cannot do
+ * that, so the title wraps its handler and clears the bits after it returns,
+ * which also stops the handler's caller looping on a bit that stays set and
+ * queueing the same swap twice. See the SDK docs, pushbuffer-executor.md,
+ * "Software Methods".
+ *
+ * RECOMP_PB_NOP_TRAP=0 turns it off.
+ */
+#define NV2A_REG(off) (*(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() \
+                                              + 0xFD000000u + (off)))
+extern void xbox_set_irq_line(uint32_t vector, int level);
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+extern volatile LONG g_nv2a_intr_hold;
+
+static void pgraph_trap_nop(uint32_t subch, uint32_t param)
+{
+    static int on = -1;
+    static unsigned timeouts;
+    LARGE_INTEGER f, t0, now;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_NOP_TRAP");
+        on = !(e && !strcmp(e, "0"));
+    }
+    if (!on || !xbox_GetConnectedInterrupt(3))
+        return;
+    {   /* RECOMP_FPS: software methods per second, by D3D's type (low 5 bits) */
+        static int fps = -1, n[32];
+        static ULONGLONG next;
+        ULONGLONG now_ms = GetTickCount64();
+        if (fps < 0) fps = getenv("RECOMP_FPS") != NULL;
+        if (fps) {
+            n[param & 31]++;
+            if (now_ms >= next) {
+                char line[256];
+                int len = 0, i;
+                for (i = 0; i < 32; i++)
+                    if (n[i])
+                        len += snprintf(line + len, sizeof line - len, " %d:%d", i, n[i]);
+                if (next) fprintf(stderr, "  [GPU] software methods/s by type:%s\n", line);
+                memset(n, 0, sizeof n);
+                next = now_ms + 1000;
+            }
+        }
+    }
+
+    InterlockedExchange(&g_nv2a_intr_hold, 1);
+    NV2A_REG(0x400704) = 0x100u | (subch << 16);   /* TRAPPED_ADDR */
+    NV2A_REG(0x400708) = param;                    /* TRAPPED_DATA_LOW */
+    NV2A_REG(0x400108) = 1;                        /* NSOURCE: notification */
+    NV2A_REG(0x400100) |= 0x00100000u;             /* PGRAPH_INTR: ERROR */
+    NV2A_REG(0x000100) |= 0x00001000u;             /* PMC_INTR: PGRAPH */
+    xbox_set_irq_line(3, 1);
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        if (!(NV2A_REG(0x400100) & 0x00100000u))
+            break;
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 100) {
+            if (timeouts++ < 5)
+                fprintf(stderr, "  [GPU] software method 0x%08X: no handler "
+                                "after 100 ms (FIFO %X PMC_INTR %X EN %X "
+                                "PGRAPH_INTR %X)\n", param,
+                        NV2A_REG(0x400720), NV2A_REG(0x000100),
+                        NV2A_REG(0x000140), NV2A_REG(0x400100));
+            break;
+        }
+        SwitchToThread();
+    }
+    xbox_set_irq_line(3, 0);
+    NV2A_REG(0x400100) &= ~0x00100000u;
+    NV2A_REG(0x000100) &= ~0x00001000u;
+    NV2A_REG(0x400108) = 0;
+    InterlockedExchange(&g_nv2a_intr_hold, 0);
+}
+
+/*
+ * FLIP_STALL: hold the pushbuffer until the display has taken a buffer.
+ *
+ * PGRAPH keeps a read and a write index into the title's ring of display
+ * buffers. FLIP_INCREMENT_WRITE advances write when a frame is finished; the
+ * title's vblank handler advances read (PGRAPH_INCREMENT, counted by the flag
+ * thread in xbox_memory_layout.c) when it has put one on screen. FLIP_STALL
+ * waits while they are equal -- every buffer finished and none yet shown --
+ * as xemu's pfifo does.
+ *
+ * This used to end the stall at once (read = write). With nothing holding
+ * it, the GPU ran as far ahead of the display as the CPU could submit, and
+ * XDK D3D, which queues each swap for a vblank count derived from the last
+ * one, pushed its targets hundreds of vblanks into the future: swaps stopped
+ * completing and the title's frame pacing collapsed to its one-second
+ * timeout.
+ *
+ * Only with vblank delivery on (RECOMP_VBLANK) and the title's GPU interrupt
+ * connected, since nothing else would ever advance read. Bounded: after three
+ * consecutive stalls that time out, pacing turns itself off with a message
+ * rather than holding every frame for 100 ms. RECOMP_PB_FLIP_PACE=0 turns it
+ * off from the start.
+ */
+extern volatile LONG g_nv2a_flip_read_incs;
+
+static void flip_stall(void)
+{
+    static int on = -1, misses;
+    LARGE_INTEGER f, t0, now;
+    uint32_t mod;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_FLIP_PACE");
+        const char *vb = getenv("RECOMP_VBLANK");
+        on = !(e && !strcmp(e, "0")) && vb && strcmp(vb, "0");
+    }
+    mod = s_gpu.flip_modulo ? s_gpu.flip_modulo : 1;
+    if (!on || !xbox_GetConnectedInterrupt(3) || mod < 2) {
+        s_gpu.flip_read = s_gpu.flip_write;
+        return;
+    }
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        LONG n = InterlockedExchange(&g_nv2a_flip_read_incs, 0);
+        s_gpu.flip_read = (s_gpu.flip_read + (uint32_t)n) % mod;
+        if (s_gpu.flip_read != s_gpu.flip_write) {
+            misses = 0;
+            return;
+        }
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 100)
+            break;
+        Sleep(0);
+    }
+    if (++misses >= 3) {
+        on = 0;
+        fprintf(stderr, "  [GPU] flip stall: the display never took a buffer "
+                        "in 3 x 100 ms; flip pacing off\n");
+    }
+    s_gpu.flip_read = s_gpu.flip_write;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+
+    if (method == 0x0100 && param) {           /* NO_OPERATION: software method */
+        pgraph_trap_nop(subch, param);
+        return;
+    }
 
     s_reg[(method & 0x1FFCu) / 4] = param;
     if (pb_verbose() && (method == 0x17C4 || (method >= 0x0C00 && method < 0x0C24))) {
@@ -2720,9 +2886,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
-        /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
-        s_gpu.flip_read = s_gpu.flip_write;
+        flip_stall();
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
@@ -2736,6 +2900,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         if (s_backend && s_backend->flip)
             s_backend->flip();
+        {   /* RECOMP_FPS: completed frames per second, once a second. A title
+             * that feeds audio streams from its frame loop starves them when
+             * this is low. */
+            static int on = -1, n;
+            static ULONGLONG next;
+            if (on < 0) on = getenv("RECOMP_FPS") != NULL;
+            if (on) {
+                ULONGLONG now = GetTickCount64();
+                n++;
+                if (now >= next) {
+                    if (next) fprintf(stderr, "  [GPU] %d frames/s\n", n);
+                    n = 0;
+                    next = now + 1000;
+                }
+            }
+        }
         if (pb_verbose()) {
             static unsigned n;
             if (n++ < 8) {
