@@ -212,6 +212,13 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
     }
     return 1;
 }
+/* The last software methods (NO_OPERATION with data) the walk executed: where,
+ * what, and what came of the trap (g_pb_trap_outcome, set by the executor:
+ * 0 not raised, 1 acknowledged, 2 timed out). For "a wake-up was lost" hangs:
+ * a title can say whether the walk ever reached the one it patched in. */
+volatile uint32_t g_pb_trap_ring[32][3];
+volatile int32_t g_pb_trap_ring_n;
+volatile int g_pb_trap_outcome;
 static uint32_t s_get = 0xFFFFFFFFu, s_ret;
 static int      s_in_call;
 
@@ -248,6 +255,17 @@ void nv2a_pb_scan(uint32_t put_phys)
             s_get = put;
             break;
         }
+        /* DMA_GET is the GPU's fetch pointer: nothing at or past it has been
+         * read. XDK D3D relies on exactly that. BlockOnTime (TC:NY 0x002BCE00)
+         * reads GET, and when its fence is at least 0x2400 bytes further on it
+         * patches a "wake me" software method into the pushbuffer at the fence
+         * and sleeps on an event. GET used to move only at each kick's 0x0310
+         * marker and at the end of a walk, so it lagged the executor by up to
+         * a whole kick: D3D patched commands the executor had already passed
+         * and slept for good (TC:NY's menu freeze, fifth form). Publishing the
+         * real position before each command keeps GET <= what is unread. */
+        if (s_exec_enabled)
+            *(volatile uint32_t *)(mem + 0xFD800044u) = s_get;
         w = *(const uint32_t *)(mem + (0x80000000u | s_get));
         s_hist[s_hist_n % PB_HIST].at = at;
         s_hist[s_hist_n % PB_HIST].w = w;
@@ -305,8 +323,16 @@ void nv2a_pb_scan(uint32_t put_phys)
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
-                if (s_exec_enabled)
+                if (s_exec_enabled) {
+                    g_pb_trap_outcome = -1;
                     nv2a_pb_exec_method(subch, m, param);
+                    if (m == 0x0100 && param) {
+                        int32_t k = g_pb_trap_ring_n++ & 31;
+                        g_pb_trap_ring[k][0] = at;
+                        g_pb_trap_ring[k][1] = param;
+                        g_pb_trap_ring[k][2] = (uint32_t)g_pb_trap_outcome;
+                    }
+                }
                 s_get = (s_get + 4) & PB_PHYS_MASK;
                 words++;
             }

@@ -1597,6 +1597,12 @@ static void bridge_NtCreateEvent(void)
     g_eax = (uint32_t)status;
 }
 
+/* An alertable wait with I/O APCs queued (RECOMP_IO_APC=deferred) runs them and
+ * returns STATUS_USER_APC without waiting, as the Xbox kernel does. */
+static int io_apc_drain(void);
+#define IO_APC_ALERTABLE_WAIT(alertable)                                   \
+    do { if ((alertable) && io_apc_drain()) { g_eax = 0x000000C0u; return; } } while (0)
+
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
@@ -1644,6 +1650,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
+    IO_APC_ALERTABLE_WAIT(alertable);
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
          * writing 0 there -- so bring the host event in line first. */
@@ -1687,6 +1694,8 @@ static void bridge_NtWaitForSingleObject(void)
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
+
+    IO_APC_ALERTABLE_WAIT(alertable);
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -1742,6 +1751,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
+    IO_APC_ALERTABLE_WAIT(alertable);
     static int logged = 0;
     if (logged++ < 20) {
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
@@ -1803,6 +1813,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
+    IO_APC_ALERTABLE_WAIT(alertable);
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
         return;
@@ -1896,7 +1907,7 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
-
+    IO_APC_ALERTABLE_WAIT(alertable);
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(interval_ptr));
@@ -2393,12 +2404,16 @@ static void kernel_vblank_tick(void)
     /* Latched until the title acknowledges it; see g_nv2a_vblank_latch in
      * xbox_memory_layout.c. The marker is PCRTC_INTR's vblank bit plus bit
      * 31, so the title's write-1-to-clear is visible as a change. */
-    {
+    {   /* under g_nv2a_intr_lock, or the ack thread can clear these between
+         * testing the latch and zeroing the registers */
         extern volatile LONG g_nv2a_vblank_latch;
+        extern SRWLOCK g_nv2a_intr_lock;
+        AcquireSRWLockExclusive(&g_nv2a_intr_lock);
         InterlockedExchange(&g_nv2a_vblank_latch, 1);
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) = 0x80000000u | NV2A_PCRTC_INTR_VBLANK;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+        ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
     }
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) = 0x80000000u | NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
         static unsigned n;
@@ -3410,6 +3425,44 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
 
 /* Per-thread pending-APC ring. An APC is delivered on the thread that issued
  * the request, which is also the thread that waits, so thread-local is right. */
+/*
+ * RECOMP_IO_APC=deferred: queue the APC and run it at the issuing thread's next
+ * alertable wait, as the Xbox kernel does. True Crime: New York City's city
+ * streamer needs it: it issues ReadFileEx, then records the request as in
+ * flight, and pumps completions with SleepEx(0, TRUE) every frame. Run inline,
+ * the completion came before the request was recorded, the request stayed "in
+ * flight" for good, and the game sat on its loading screen with the city
+ * loaded behind it.
+ */
+#define IO_APC_RING 64
+static __declspec(thread) uint32_t t_io_apc[IO_APC_RING][3];
+static __declspec(thread) unsigned t_io_apc_head, t_io_apc_tail;
+
+static int io_apc_deferred(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_IO_APC");
+        on = e && !_stricmp(e, "deferred");
+        if (on) fprintf(stderr, "  [KERNEL] file I/O APCs deferred to alertable waits\n");
+    }
+    return on;
+}
+
+/* Run this thread's queued I/O APCs. Returns how many ran. */
+static int io_apc_drain(void)
+{
+    int n = 0;
+    while (t_io_apc_tail != t_io_apc_head) {
+        uint32_t *a = t_io_apc[t_io_apc_tail % IO_APC_RING];
+        uint32_t r = a[0], c = a[1], s = a[2];
+        t_io_apc_tail++;
+        deliver_one_apc(r, c, s);
+        n++;
+    }
+    return n;
+}
+
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
                                     uint32_t apc_context, uint32_t iostatus)
 {
@@ -3418,7 +3471,13 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         if (ev) SetEvent(ev);
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        if (io_apc_deferred() && t_io_apc_head - t_io_apc_tail < IO_APC_RING) {
+            uint32_t *a = t_io_apc[t_io_apc_head % IO_APC_RING];
+            a[0] = apc_routine; a[1] = apc_context; a[2] = iostatus;
+            t_io_apc_head++;
+        } else {
+            deliver_one_apc(apc_routine, apc_context, iostatus);
+        }
     }
 }
 

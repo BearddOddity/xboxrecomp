@@ -754,6 +754,14 @@ int nv2a_exec_busy_percent(void) { return s_exec_busy_pct; }
  * zeroing them here would take it away before the handler looks. */
 volatile LONG g_nv2a_intr_hold;
 
+/* Serialises raising an interrupt (setting its hold or latch flag and its
+ * pending bits) with nv2a_ack_flags, which tests those flags and then clears
+ * the registers. Unlocked, a trap raised between that test and that clear lost
+ * its pending bit before the handler looked, and the executor took the cleared
+ * bit for the handler's acknowledgement: one TC:NY BlockOnTime wake-up in a
+ * few hundred vanished that way, and the game hung waiting for it. */
+SRWLOCK g_nv2a_intr_lock = SRWLOCK_INIT;
+
 /*
  * A vertical blank stays pending until the title acknowledges it.
  *
@@ -849,7 +857,16 @@ static void nv2a_ptimer(volatile uint32_t *regs)
     }
 }
 
+static void nv2a_ack_flags_locked(volatile uint32_t *regs);
+
 static void nv2a_ack_flags(volatile uint32_t *regs)
+{
+    AcquireSRWLockExclusive(&g_nv2a_intr_lock);
+    nv2a_ack_flags_locked(regs);
+    ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
+}
+
+static void nv2a_ack_flags_locked(volatile uint32_t *regs)
 {
     nv2a_vblank_ack(regs);
     nv2a_ptimer(regs);

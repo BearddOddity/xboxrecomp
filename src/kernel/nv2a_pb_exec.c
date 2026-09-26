@@ -2586,6 +2586,7 @@ static int capture_render_state(uint32_t method, uint32_t param)
 extern void xbox_set_irq_line(uint32_t vector, int level);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern volatile LONG g_nv2a_intr_hold;
+extern SRWLOCK g_nv2a_intr_lock;
 
 static void pgraph_trap_nop(uint32_t subch, uint32_t param)
 {
@@ -2597,6 +2598,8 @@ static void pgraph_trap_nop(uint32_t subch, uint32_t param)
         const char *e = getenv("RECOMP_PB_NOP_TRAP");
         on = !(e && !strcmp(e, "0"));
     }
+    extern volatile int g_pb_trap_outcome;
+    g_pb_trap_outcome = 0;
     if (!on || !xbox_GetConnectedInterrupt(3))
         return;
     {   /* RECOMP_FPS: software methods per second, by D3D's type (low 5 bits) */
@@ -2619,26 +2622,34 @@ static void pgraph_trap_nop(uint32_t subch, uint32_t param)
         }
     }
 
+    /* Hold and pending bits together, under the lock nv2a_ack_flags clears
+     * the registers with (see g_nv2a_intr_lock). */
+    AcquireSRWLockExclusive(&g_nv2a_intr_lock);
     InterlockedExchange(&g_nv2a_intr_hold, 1);
     NV2A_REG(0x400704) = 0x100u | (subch << 16);   /* TRAPPED_ADDR */
     NV2A_REG(0x400708) = param;                    /* TRAPPED_DATA_LOW */
     NV2A_REG(0x400108) = 1;                        /* NSOURCE: notification */
     NV2A_REG(0x400100) |= 0x00100000u;             /* PGRAPH_INTR: ERROR */
     NV2A_REG(0x000100) |= 0x00001000u;             /* PMC_INTR: PGRAPH */
+    ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
     xbox_set_irq_line(3, 1);
 
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
     for (;;) {
-        if (!(NV2A_REG(0x400100) & 0x00100000u))
+        if (!(NV2A_REG(0x400100) & 0x00100000u)) {
+            g_pb_trap_outcome = 1;
             break;
+        }
         /* The vblank interrupt shares the GPU vector. Handling it can leave
          * PMC_INTR with only the PCRTC bit (TC:NY's menu: "PMC_INTR 1000000
          * EN 0" on the one BlockOnTime wake-up, software method 5, that was
          * never delivered, out of 189). The trap is still pending, so say so
          * again rather than let it be lost. */
         if (!(NV2A_REG(0x000100) & 0x00001000u)) {
+            AcquireSRWLockExclusive(&g_nv2a_intr_lock);
             NV2A_REG(0x000100) |= 0x00001000u;
+            ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
             xbox_set_irq_line(3, 1);
         }
         QueryPerformanceCounter(&now);
@@ -2649,15 +2660,18 @@ static void pgraph_trap_nop(uint32_t subch, uint32_t param)
                                 "PGRAPH_INTR %X)\n", param,
                         NV2A_REG(0x400720), NV2A_REG(0x000100),
                         NV2A_REG(0x000140), NV2A_REG(0x400100));
+            g_pb_trap_outcome = 2;
             break;
         }
         SwitchToThread();
     }
     xbox_set_irq_line(3, 0);
+    AcquireSRWLockExclusive(&g_nv2a_intr_lock);
     NV2A_REG(0x400100) &= ~0x00100000u;
     NV2A_REG(0x000100) &= ~0x00001000u;
     NV2A_REG(0x400108) = 0;
     InterlockedExchange(&g_nv2a_intr_hold, 0);
+    ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
 }
 
 /*
@@ -2747,16 +2761,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * is when the GPU would. */
     if (method == 0x0310 && subch == 5) {
         NV2A_REG(0x400B10) = param;
-        /* The value also carries the address the method was written at
-         * (param >> 5). D3D waits for this register to show the kick's fence,
-         * then reads DMA_GET to see how far the GPU has got -- and GET was
-         * written only after the whole walk reached PUT, so it still said the
-         * previous PUT. D3D then took the GPU to be behind and slept on an
-         * event (TC:NY's menu freeze, second form). Publishing the address
-         * here says what the GPU really has read. The ack thread writes
-         * GET = PUT when the walk ends, before it checks GET for a resync, so
-         * this cannot be mistaken for the title moving GET. */
-        NV2A_REG(0x800044) = (param >> 5) & 0x03FFFFFCu;   /* USER DMA_GET */
+        /* DMA_GET is published by the walk itself (nv2a_pb_scan), before every
+         * command, so it is not set from this marker: the marker's address is
+         * behind the executor's read position, and a GET behind the real one
+         * is what let D3D patch commands already executed. */
         return;
     }
 
