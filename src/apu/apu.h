@@ -31,6 +31,11 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
 
+/* Acknowledge a DirectSound DSP command doorbell at this guest address once
+ * per APU frame (write 0), like RECOMP_APU_DSP_ACK but registered at run time,
+ * for a command block whose address is only known once DirectSound made it. */
+void mcpx_apu_dsp_ack_add(uint32_t guest_addr);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

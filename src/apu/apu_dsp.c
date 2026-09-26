@@ -54,7 +54,9 @@
  */
 #define APU_DSP_ACK_MAX 8
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
-static int s_dsp_ack_count = -1;
+/* volatile: mcpx_apu_dsp_ack_add runs on the title's thread, the ack on the
+ * APU frame thread. */
+static volatile int s_dsp_ack_count = -1;
 
 static void dsp_ack_init(void)
 {
@@ -77,6 +79,30 @@ static void dsp_ack_init(void)
     if (s_dsp_ack_count)
         fprintf(stderr, "[APU] DSP doorbell ack: %d address(es), first 0x%08X\n",
                 s_dsp_ack_count, s_dsp_ack[0]);
+}
+
+/* Register a doorbell from the game project, for titles whose command block
+ * address is only known at run time (it hangs off a DirectSound object, so a
+ * fixed RECOMP_APU_DSP_ACK address breaks as soon as heap order changes).
+ * Idempotent. The APU thread reads the list each frame: the slot is written
+ * before the count that publishes it. */
+void mcpx_apu_dsp_ack_add(uint32_t guest_addr)
+{
+    int i;
+
+    if (s_dsp_ack_count < 0)
+        dsp_ack_init();
+    if (!guest_addr)
+        return;
+    for (i = 0; i < s_dsp_ack_count; i++)
+        if (s_dsp_ack[i] == guest_addr)
+            return;
+    if (s_dsp_ack_count >= APU_DSP_ACK_MAX)
+        return;
+    s_dsp_ack[s_dsp_ack_count] = guest_addr;
+    s_dsp_ack_count++;
+    fprintf(stderr, "[APU] DSP doorbell ack: 0x%08X registered by the title\n",
+            guest_addr);
 }
 
 /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
