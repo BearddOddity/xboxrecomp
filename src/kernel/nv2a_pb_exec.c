@@ -382,6 +382,17 @@ static void note_unhandled(uint32_t method, uint32_t param)
     uint16_t *slot = &s_unhandled_slot[(method & 0x1FFC) / 4];
 
     s_gpu.unhandled_total++;
+    if ((method == 0x1E70 || method == 0x1E6C) && getenv("RECOMP_DBG_SHADERSTAGE")) {
+        static uint32_t seen[2][32];   /* distinct values of SHADER_STAGE_PROGRAM / CLIP_PLANE_MODE */
+        uint32_t *s = seen[method == 0x1E6C];
+        int k;
+        for (k = 0; k < 32 && s[k] && s[k] != param + 1; k++)
+            ;
+        if (k < 32 && !s[k]) {
+            s[k] = param + 1;
+            fprintf(stderr, "[STAGE] method 0x%04X new value 0x%08X\n", method, param);
+        }
+    }
     if (*slot) {
         s_unhandled[*slot - 1].count++;
         s_unhandled[*slot - 1].last_param = param;
@@ -1880,6 +1891,36 @@ static void backend_batch(void)
     if (!n)
         return;
 
+    if (getenv("RECOMP_DBG_QUAD") && n == 6 && s_gpu.rs.blend_enable) {   /* fades, overlays */
+        static uint32_t last[6];
+        uint32_t cur[6];
+        cur[0] = s_bverts[0].diffuse; cur[1] = s_reg[0x0A60 / 4]; cur[2] = s_reg[0x0288 / 4];
+        cur[3] = s_reg[0x028C / 4]; cur[4] = s_reg[0x0AC0 / 4]; cur[5] = s_reg[0x0260 / 4];
+        if (memcmp(cur, last, sizeof cur)) {
+            memcpy(last, cur, sizeof cur);
+            fprintf(stderr, "[QUAD] flip %u diffuse %08X factor0 %08X final %08X/%08X c0 icw %08X a0 icw %08X"
+                    " blend 0x%X/0x%X tex %s xy %.0f,%.0f rhw %g\n", s_gpu.flips, cur[0], cur[1], cur[2], cur[3],
+                    cur[4], cur[5], s_gpu.rs.blend_src, s_gpu.rs.blend_dst,
+                    (s_gpu.tex.valid && texcoord_attr()->offset) ? "yes" : "no",
+                    s_bverts[0].x, s_bverts[0].y, s_bverts[0].rhw);
+        }
+    }
+
+    if (getenv("RECOMP_DBG_STENCIL")) {   /* per second: batches with stencil test on, and its state */
+        static unsigned on, total;
+        static DWORD next;
+        total++;
+        if (s_reg[0x032C / 4]) on++;
+        if (GetTickCount() > next) {
+            next = GetTickCount() + 1000;
+            fprintf(stderr, "[STENCIL] %u/%u batches with stencil on | mask %08X func %08X ref %08X fmask %08X"
+                    " fail %04X zfail %04X zpass %04X | clear 0x%08X\n", on, total,
+                    s_reg[0x0360 / 4], s_reg[0x0364 / 4], s_reg[0x0368 / 4], s_reg[0x036C / 4],
+                    s_reg[0x0370 / 4], s_reg[0x0374 / 4], s_reg[0x0378 / 4], s_gpu.zstencil_clear);
+            on = total = 0;
+        }
+    }
+
     if (getenv("RECOMP_DBG_EYE") && n >= 1500) {   /* camera of big (level) draws */
         static DWORD next_eye;
         if (GetTickCount() > next_eye) {
@@ -1938,9 +1979,46 @@ static void backend_batch(void)
     batch.count = n;
     batch.texture = NULL;
     batch.state = &s_gpu.rs;
+    /* Back ends draw texture x colour. Follow a one-stage combiner program
+     * that far: whether it reads texture 0 at all, and where its colour comes
+     * from (the vertex V0, the constant factor0 C0, or neither = white).
+     * one title's screen fade is V0 x 1 drawn with the last texture still
+     * bound; multiplying by that texture hid the fade, and a camera cut that
+     * happens under it (subway stairs) showed through as walls. */
+    int comb_tex = 1;
+    {
+        uint32_t icw[2] = { s_reg[0x0AC0 / 4], s_reg[0x0260 / 4] };   /* stage 0 colour, alpha */
+        uint32_t stages = s_reg[0x1E60 / 4] & 0xFF;
+        int k, b, t = 0, v0 = 0, c0 = 0;
+        if (stages <= 1 && (icw[0] || icw[1])) {
+            for (k = 0; k < 2; k++)
+                for (b = 0; b < 4; b++) {
+                    uint32_t r = (icw[k] >> (b * 8)) & 0xF;
+                    t |= r == 8; v0 |= r == 4; c0 |= r == 1;
+                }
+            comb_tex = t;
+            if (!t && n >= 30 && getenv("RECOMP_DBG_QUAD")) {
+                static DWORD next_nt;
+                if (GetTickCount() > next_nt) {
+                    next_nt = GetTickCount() + 500;
+                    fprintf(stderr, "[COMB] untextured batch %u verts: ctl %08X c0 %08X a0 %08X c1 %08X a1 %08X"
+                            " f0 %08X fin %08X/%08X diffuse %08X blend %u atest %u\n", n, s_reg[0x1E60 / 4],
+                            icw[0], icw[1], s_reg[0x0AC4 / 4], s_reg[0x0264 / 4], s_reg[0x0A60 / 4],
+                            s_reg[0x0288 / 4], s_reg[0x028C / 4], s_bverts[0].diffuse,
+                            s_gpu.rs.blend_enable, s_gpu.rs.alpha_test_enable);
+                }
+            }
+            if (!v0) {
+                uint32_t c = c0 ? s_reg[0x0A60 / 4] : 0xFFFFFFFFu;
+                uint32_t i;
+                for (i = 0; i < n; i++)
+                    s_bverts[i].diffuse = c;
+            }
+        }
+    }
     {
         const VertexAttr *tc = texcoord_attr();
-        if (s_gpu.tex.valid && tc->offset && tc->stride) {
+        if (comb_tex && s_gpu.tex.valid && tc->offset && tc->stride) {
             tex.offset = s_gpu.tex.offset;
             tex.width  = s_gpu.tex.width;
             tex.height = s_gpu.tex.height;
