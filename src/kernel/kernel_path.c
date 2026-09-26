@@ -439,6 +439,25 @@ translate:
             CreateDirectoryW(dir_path, NULL);
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+            /* Override directory (RECOMP_OVERRIDE_DIR): a game-disc file that
+             * also exists there is taken from there instead, so modded assets
+             * load without touching the disc copy. */
+            if (base_dir == s_game_dir && remainder_wide[0]) {
+                static WCHAR over[MAX_PATH];
+                static int have = -1;
+                WCHAR alt[MAX_PATH];
+                DWORD a;
+                if (have < 0)
+                    have = GetEnvironmentVariableW(L"RECOMP_OVERRIDE_DIR", over, MAX_PATH) > 0;
+                if (have) {
+                    swprintf_s(alt, MAX_PATH, L"%s\\%s", over, remainder_wide);
+                    a = GetFileAttributesW(alt);
+                    if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+                        wcscpy_s(host_path_buf, buf_size, alt);
+                        fprintf(stderr, "  [PATH] override: %S\n", alt);
+                    }
+                }
+            }
         }
 
         /* An empty remainder means the title opened the device itself, so
