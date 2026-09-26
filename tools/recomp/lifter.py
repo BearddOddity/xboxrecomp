@@ -896,7 +896,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
-        # ZF/SF not modified by rotations - can't resolve most conditions
+        # ZF/SF not modified by rotations - can't resolve most conditions.
+        # rcl/rcr leave the rotated-out bit in _cf, so the carry pair is exact.
+        if flag_setter in ("rcl", "rcr"):
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
         return None
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
@@ -1352,6 +1358,16 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
+        # MXCSR is guest state, like the x87 control word: kept in g_mxcsr and
+        # not pushed to the host, whose own float code (and the lifted x87,
+        # which runs on host SSE) must not inherit a guest rounding mode.
+        if m in ("stmxcsr", "ldmxcsr") and nops == 1 and ops[0].type == "mem":
+            addr = _fmt_mem(ops[0])
+            if m == "stmxcsr":
+                return [f"MEM32({addr}) = g_mxcsr; /* stmxcsr */"]
+            return [f"g_mxcsr = MEM32({addr}); /* ldmxcsr */"]
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -2080,6 +2096,36 @@ class Lifter:
         suffix = {8: "8", 16: "16"}.get(bits, "32")
         func = ("ROL" if m == "rol" else "ROR") + suffix
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: rotate through CF, a (width + 1)-bit rotation.
+
+        MSVC's 64-bit divide helpers halve a 64-bit value with "shr edx, 1 /
+        rcr eax, 1": the bit shifted out of the high half arrives through CF
+        as the top bit of the low half. Emitted as a comment, the low half was
+        never shifted and the quotient came out wrong.
+
+        The count is masked to 5 bits and, for 8- and 16-bit operands, then
+        reduced modulo width + 1, as the hardware does. CF is read here, so the
+        translator declares _cf in every function that holds one of these.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
+        w = (_operand_width(ops[0]) or 4) * 8
+        if w < 32:
+            cnt = f"({cnt} % {w + 1}u)"
+        mask = {8: "0xFFu", 16: "0xFFFFu"}.get(w, "0xFFFFFFFFu")
+        if m == "rcr":
+            step = (f"_rc = (int)(_rv & 1u); "
+                    f"_rv = (_rv >> 1) | ((uint32_t)_cf << {w - 1}); _cf = _rc;")
+        else:
+            step = (f"_rc = (int)((_rv >> {w - 1}) & 1u); "
+                    f"_rv = ((_rv << 1) | (uint32_t)_cf) & {mask}; _cf = _rc;")
+        return ["{ uint32_t _rv = %s; unsigned _rn = %s; int _rc;"
+                " while (_rn--) { %s } %s } /* %s */"
+                % (dst, cnt, step, _fmt_operand_write(ops[0], "_rv"), m)]
 
     # ── Compare / Test (standalone) ──
 

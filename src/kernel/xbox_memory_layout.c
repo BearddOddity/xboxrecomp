@@ -1071,6 +1071,9 @@ RECOMP_TLS int g_fp_top = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
+/* SSE control/status: every exception masked, round to nearest, no FTZ/DAZ.
+ * The processor's reset value, and what a thread sees before ldmxcsr. */
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
 RECOMP_TLS int g_fp_cmp = 0;
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 

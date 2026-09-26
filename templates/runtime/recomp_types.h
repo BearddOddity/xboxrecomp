@@ -250,6 +250,9 @@ extern RECOMP_TLS int g_df;
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
+/* Guest SSE control/status (stmxcsr/ldmxcsr). Guest state only: it is not
+   loaded into the host MXCSR. */
+extern RECOMP_TLS uint32_t g_mxcsr;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
