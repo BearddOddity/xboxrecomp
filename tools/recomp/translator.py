@@ -783,7 +783,10 @@ class FunctionTranslator:
         if end <= start:
             return None
 
-        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
+        # def_name: the body is emitted under another name (a recomp_manual.c
+        # wrapper owns "name"); callers and the dispatch table keep "name".
+        name = func_info.get("def_name") or _func_ident(
+            start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
         instructions, blocks = self.decode_function(start, end)
         if not blocks:
@@ -1413,6 +1416,9 @@ class BatchTranslator:
             name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
+            if func_info.get("def_name"):
+                c_chunks.append(
+                    f"{self._make_declaration(addr, func_info['def_name'])};")
         c_chunks.append("")
         c_chunks.append("/* ═══════════════════════════════════════════════════ */")
         c_chunks.append("")
