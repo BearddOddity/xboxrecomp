@@ -2738,6 +2738,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * is when the GPU would. */
     if (method == 0x0310 && subch == 5) {
         NV2A_REG(0x400B10) = param;
+        /* The value also carries the address the method was written at
+         * (param >> 5). D3D waits for this register to show the kick's fence,
+         * then reads DMA_GET to see how far the GPU has got -- and GET was
+         * written only after the whole walk reached PUT, so it still said the
+         * previous PUT. D3D then took the GPU to be behind and slept on an
+         * event (TC:NY's menu freeze, second form). Publishing the address
+         * here says what the GPU really has read. The ack thread writes
+         * GET = PUT when the walk ends, before it checks GET for a resync, so
+         * this cannot be mistaken for the title moving GET. */
+        NV2A_REG(0x800044) = (param >> 5) & 0x03FFFFFCu;   /* USER DMA_GET */
         return;
     }
 
