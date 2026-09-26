@@ -293,6 +293,19 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
+    /* Relative paths are resolved against the CWD now, once. SHCreateDirectoryExW
+     * below rejects a relative path outright, so "saves" silently created no
+     * directory and no partition images; the title then found no hard disk and
+     * rebooted to the dashboard. Absolute paths also stop a later CWD change
+     * from moving the game's files out from under it. */
+    {
+        WCHAR full[MAX_PATH];
+        if (GetFullPathNameW(s_game_dir, MAX_PATH, full, NULL))
+            wcscpy_s(s_game_dir, MAX_PATH, full);
+        if (GetFullPathNameW(s_save_dir, MAX_PATH, full, NULL))
+            wcscpy_s(s_save_dir, MAX_PATH, full);
+    }
+
     size_t len = wcslen(s_game_dir);
     if (len > 0 && s_game_dir[len - 1] == L'\\')
         s_game_dir[len - 1] = L'\0';
