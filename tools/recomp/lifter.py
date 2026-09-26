@@ -409,6 +409,9 @@ _FLAGS_UNDEFINED = frozenset({
 
 # Scalar single-precision compares (CMPSS with its predicate folded into the
 # mnemonic, as capstone prints it) -> C test producing the lane-0 mask.
+# String compares that set ZF for a following jcc, at any element width.
+_STRING_COMPARE_RE = re.compile(r"\b(cmps|scas)[bwd]\b")
+
 _SCALAR_CMP_SS = {
     "cmpeqss":    "{a} == {b}",
     "cmpltss":    "{a} < {b}",
@@ -3749,13 +3752,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
             pass  # SETcc doesn't set flags
         elif curr.mnemonic.startswith("rep"):
             # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
+            # repe cmps / repne scas = comparison, sets flags -- every width,
+            # not just bytes. `repe cmpsd` is how MSVC compares GUIDs; while
+            # only cmpsb/scasb counted, the jne after a cmpsd resolved against
+            # whatever set flags before it (an `xor edx, edx` in the XDK WMA
+            # decoder's ASF walker), so "not equal" was constant and every
+            # object was taken for the first GUID tested.
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            if (_STRING_COMPARE_RE.search(raw_m)
+                    or _STRING_COMPARE_RE.search(rest)):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:
