@@ -1100,6 +1100,11 @@ static void bridge_NtAllocateVirtualMemory(void)
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
+    /* The kernel hands out zeroed pages. The heap reuses freed blocks without
+     * clearing them, and the XAPI heap on top trusts fresh segments to be
+     * zero: True Crime's world object took a recycled block and read the old
+     * contents as resource links and cell data -- a different crash every run. */
+    memset(XBOX_TO_NATIVE(xbox_va), 0, size);
 
     /* Write back the allocated address and actual size */
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
@@ -1243,11 +1248,18 @@ static void bridge_NtFreeVirtualMemory(void)
          * filled the heap within seconds once its audio started streaming. */
         {
             extern uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
-            if (xbox_HeapBlockSize(vm_base)) {
+            uint32_t left = xbox_HeapBlockSize(vm_base);
+            if (left) {
                 if (free_type & 0x8000) {          /* MEM_RELEASE */
                     xbox_HeapFree(vm_base);
                     BRIDGE_MEM32(size_ptr) = 0;
-                }                                  /* MEM_DECOMMIT: nothing to give back */
+                } else {
+                    /* MEM_DECOMMIT keeps the block, but on the console the
+                     * pages are gone and a later MEM_COMMIT (a no-op here)
+                     * brings them back zeroed. Zero them now so it does. */
+                    uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
+                    memset(XBOX_TO_NATIVE(vm_base), 0, n);
+                }
                 g_eax = 0;
                 return;
             }
