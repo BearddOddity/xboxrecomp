@@ -44,6 +44,20 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+static int s_scan_enabled = -1;
+
+/* Either switch, read once. The answer "not set" has to be cached as well as
+ * "set": this runs on every pass of the NV2A poll loop, and on the default
+ * path -- neither switch set -- a cache that only remembered "set" called
+ * getenv on every pass, which walks the whole environment. */
+static int pb_walk_enabled(void)
+{
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (s_scan_enabled < 0)
+        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+    return s_exec_enabled || s_scan_enabled;
+}
 
 /* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
  * pushbuffer word, so a linear search here was the executor's largest cost
@@ -220,6 +234,8 @@ static int      s_in_call;
  * position would read whatever lies between as commands. */
 void nv2a_pb_resync(uint32_t get_phys)
 {
+    if (!pb_walk_enabled())
+        return;
     pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
     s_get = get_phys & PB_PHYS_MASK;
     s_in_call = 0;
@@ -231,9 +247,7 @@ void nv2a_pb_scan(uint32_t put_phys)
     uint32_t put = put_phys & PB_PHYS_MASK;
     uint32_t words = 0, jumps = 0, unknown = 0;
 
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")))
+    if (!pb_walk_enabled())
         return;
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put;
