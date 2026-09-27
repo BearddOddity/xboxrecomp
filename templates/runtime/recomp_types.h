@@ -517,6 +517,15 @@ RECOMP_XMM_LANEWISE(XMM_DIV, a.f[i] / b.f[i])
  * equal -- that is the hardware's tie-break, not a C fmin/fmax. */
 RECOMP_XMM_LANEWISE(XMM_MIN, (a.f[i] < b.f[i]) ? a.f[i] : b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MAX, (a.f[i] > b.f[i]) ? a.f[i] : b.f[i])
+/* sqrtps/rsqrtps/rcpps: every lane of the source (a, the old destination,
+ * is not read). Computing only lane 0 left lanes 1-3 holding the squared
+ * length in the usual normalize (rsqrtps then mulps), so y and z came out
+ * scaled by |v|^2: True Crime placed its title-screen cars thousands of
+ * units off the road. rsqrtps/rcpps are exact here; the CPU's are 12-bit
+ * approximations. */
+RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RCP,   1.0f / b.f[i])
 
 #define RECOMP_XMM_BITWISE(name, expr)                                    \
     static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \

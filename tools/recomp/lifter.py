@@ -3174,26 +3174,16 @@ class Lifter:
                 return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}") + " /* rcpss */"]
 
         # ── Packed sqrt / reciprocal / rsqrt ──
-        # The SSE model here tracks only the low lane as a single float, so
-        # these compute the low lane like their scalar ...ss forms rather than
-        # all four. That is the same low-lane approximation the packed
-        # arithmetic ops (addps/mulps) already use -- but computing the low lane
-        # is strictly better than the TODO no-op these used to hit, which left
-        # the destination stale and fed garbage into vector normalisation.
-        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; some titles
-        # use them heavily, which is why this surfaced on those binaries.
-        if m == "sqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
-                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rsqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
-                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rcpps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
-                        + " /* rcpps (low lane; 4-lane model TODO) */"]
+        # All four lanes, like the other packed ops. These used to compute
+        # lane 0 only, and rsqrtps is the core of every vector normalize:
+        # after "shufps x, x, 0; rsqrtps x, x; mulps v, x" lanes 1-3 of x
+        # still held |v|^2, so y and z were scaled by it instead of 1/|v|.
+        if m in ("sqrtps", "rsqrtps", "rcpps"):
+            lifted = _packed_binary({"sqrtps": "XMM_SQRT", "rsqrtps": "XMM_RSQRT",
+                                     "rcpps": "XMM_RCP"}[m])
+            if lifted is not None:
+                return lifted
+            return [f"/* TODO: {m} {insn.op_str} */"]
 
         # ── Packed comparison ──
         if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
