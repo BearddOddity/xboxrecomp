@@ -2036,7 +2036,10 @@ static void backend_batch(void)
     }
     {
         const VertexAttr *tc = texcoord_attr();
-        if (comb_tex && s_gpu.tex.valid && tc->offset && tc->stride) {
+        /* A vertex program writes oT0 itself, from whatever inputs it reads
+         * (True Crime's meshes pack theirs as shorts), so a float2 stream
+         * need not exist for the batch to be textured. */
+        if (comb_tex && s_gpu.tex.valid && (batch_is_vp() || (tc->offset && tc->stride))) {
             tex.offset = s_gpu.tex.offset;
             tex.width  = s_gpu.tex.width;
             tex.height = s_gpu.tex.height;
