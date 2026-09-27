@@ -483,6 +483,8 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 #define NV097_SET_COMPOSITE_MATRIX_LAST  0x06BC
 #define NV097_SET_VIEWPORT_OFFSET_FIRST  0x0A20
 #define NV097_SET_VIEWPORT_OFFSET_LAST   0x0A2C
+#define NV097_SET_VIEWPORT_SCALE_FIRST   0x0AF0
+#define NV097_SET_VIEWPORT_SCALE_LAST    0x0AFC
 #define NV097_SET_TRANSFORM_EXEC_MODE    0x1E94
 #define NV_XFORM_MODE_PROGRAM            2   /* low two bits; 0 = fixed */
 
@@ -765,6 +767,22 @@ static const VpOut *vp_vertex(uint32_t index)
         fetch_attr(&s_gpu.attr[a], index, v[a]);
     o = index < VP_CACHE ? &s_vp_cache[index] : &uncached;
     vp_run(v, o);
+    {   /* RECOMP_VP_TRACE=1: once a second, one vertex through the program --
+         * input position, result, and the viewport constants the XDK tail
+         * uses (c[-38] and c[-37] = slots 58 and 59). */
+        static int trace = -1;
+        static ULONGLONG next;
+        if (trace < 0) trace = getenv("RECOMP_VP_TRACE") != NULL;
+        if (trace && GetTickCount64() >= next) {
+            next = GetTickCount64() + 1000;
+            fprintf(stderr, "[VP] start %u v0 %g %g %g %g -> pos %g %g %g %g d0 %g %g %g %g | c58 %g %g %g %g c59 %g %g %g %g | const_load %u\n",
+                    s_vp.prog_start, v[0][0], v[0][1], v[0][2], v[0][3],
+                    o->pos[0], o->pos[1], o->pos[2], o->pos[3],
+                    o->d0[0], o->d0[1], o->d0[2], o->d0[3],
+                    s_vp.c[58][0], s_vp.c[58][1], s_vp.c[58][2], s_vp.c[58][3],
+                    s_vp.c[59][0], s_vp.c[59][1], s_vp.c[59][2], s_vp.c[59][3], s_vp.const_load);
+        }
+    }
     if (index < VP_CACHE)
         s_vp_stamp[index] = s_vp.gen;
     return o;
@@ -3017,10 +3035,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.composite_set = 1;
             break;
         }
+        /* The viewport registers double as vertex-program constants: offset is
+         * c[59] and scale is c[58] (c[-37] and c[-38] to a shader), which is
+         * where the tail the XDK appends to every vertex shader reads them
+         * (mul oPos.xyz, R12, c[-38]; mad oPos.xyz, R12, R1.x, c[-37]). D3D
+         * never uploads them as constants; without the mirror every 3D vertex
+         * landed at x = y = z = 0 and the world was black. */
         if (method >= NV097_SET_VIEWPORT_OFFSET_FIRST
          && method <= NV097_SET_VIEWPORT_OFFSET_LAST) {
             memcpy(&s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET_FIRST) / 4],
                    &param, 4);
+            memcpy(&s_vp.c[59][(method - NV097_SET_VIEWPORT_OFFSET_FIRST) / 4], &param, 4);
+            s_vp.gen++;
+            break;
+        }
+        if (method >= NV097_SET_VIEWPORT_SCALE_FIRST
+         && method <= NV097_SET_VIEWPORT_SCALE_LAST) {
+            memcpy(&s_vp.c[58][(method - NV097_SET_VIEWPORT_SCALE_FIRST) / 4], &param, 4);
+            s_vp.gen++;
             break;
         }
         if (method == NV097_SET_TRANSFORM_EXEC_MODE) {
