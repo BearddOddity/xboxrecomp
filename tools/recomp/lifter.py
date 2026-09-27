@@ -3487,7 +3487,7 @@ class Lifter:
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
-            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+            return [f"fp_top() = recomp_fround(fp_top(), g_fp_control_word); /* frndint */"]
         if m == "fldpi":
             return [f"fp_push(3.14159265358979323846); /* fldpi */"]
         if m == "fldl2e":

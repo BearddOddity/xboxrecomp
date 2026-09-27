@@ -271,21 +271,25 @@ static inline uint16_t recomp_fxam(double value) {
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
-/* x87 integer stores use the guest RC bits, independently of host rounding.
- * Masked invalid conversions store the signed integer-indefinite value. */
-static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
-    double rounded;
+/* x87 rounding under the guest RC bits (control word bits 10-11),
+ * independently of host rounding. frndint and fist both use it: the CRT's
+ * floor() and ceil() set RC to down or up and then run frndint, so a
+ * frndint that always rounds to nearest turns floor(6.15) into 7. */
+static inline double recomp_fround(double value, uint16_t control) {
     switch((control>>10)&3) {
-    case 1: rounded=floor(value); break;
-    case 2: rounded=ceil(value); break;
-    case 3: rounded=trunc(value); break;
+    case 1: return floor(value);
+    case 2: return ceil(value);
+    case 3: return trunc(value);
     default: {
         double lo=floor(value), fraction=value-lo;
-        rounded=lo;
-        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
-        break;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) return lo+1.0;
+        return lo;
     }
     }
+}
+/* Masked invalid conversions store the signed integer-indefinite value. */
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    double rounded=recomp_fround(value, control);
     double limit=ldexp(1.0,(int)bits-1);
     if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
