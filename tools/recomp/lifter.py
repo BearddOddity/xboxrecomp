@@ -3698,6 +3698,21 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # lahf after a float compare: AH gets SF ZF 0 AF 0 PF 1 CF. MSVC
+        # tests float equality as `ucomiss/fucomip; lahf; test ah, 0x44; jnp`.
+        # lahf used to be a comment, so that test read whatever AH held: TC:NY
+        # took every ground-height probe for "no ground", placed its ambient
+        # spawns at y = 1e37, and rejected all of them forever (419 sites).
+        if curr.mnemonic == "lahf" and last_flag_setter in (
+                "fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi",
+                "comiss", "comisd", "ucomiss", "ucomisd"):
+            c = ("g_fp_cmp" if last_flag_setter.startswith("f")
+                 else "RECOMP_FCMP(_fca, _fcb)")
+            stmts.append(f"{{ int _c = {c}; SET_HI8(eax, _c == 2 ? 0x47u : _c < 0 ? 0x03u"
+                         f" : _c == 0 ? 0x42u : 0x02u); }} /* lahf after {last_flag_setter} */")
+            i += 1
+            continue
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
