@@ -46,6 +46,11 @@ extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
+/* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
+ * words while executing, so kickoffs are answered mid-walk. */
+extern void xbox_Nv2aAckBusyBits(void);
+static uint32_t s_ack_tick;
+
 /* Either switch, read once. The answer "not set" has to be cached as well as
  * "set": this runs on every pass of the NV2A poll loop, and on the default
  * path -- neither switch set -- a cache that only remembered "set" called
@@ -257,6 +262,10 @@ void nv2a_pb_scan(uint32_t put_phys)
     while (s_get != put) {
         uint32_t at = s_get, target;
         uint32_t w;
+
+        /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
+        if (s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+            xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
             s_get = put;

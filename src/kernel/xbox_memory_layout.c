@@ -872,17 +872,35 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Clear the request bits "hardware" would clear on its own.
+ *
+ * Also called by the pushbuffer walker between commands. This thread executes
+ * the pushbuffer below, and under RECOMP_PB_EXEC one pass can take a whole
+ * rendered frame; with the bits cleared only here, every XDK D3D kickoff --
+ * which sets 0x100410 bit 16 and spins until it clears -- waited that long,
+ * and a level load, thousands of kickoffs long, looked frozen. Clearing them
+ * from inside the walk answers the kickoff within a few hundred commands,
+ * without a thread of its own spinning on a host core. */
+void xbox_Nv2aAckBusyBits(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+
+    if (!regs)
+        return;
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        if (*r & NV2A_ACK[i].busy_mask) {
+            *r &= ~NV2A_ACK[i].busy_mask;
+        }
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
-        }
+        xbox_Nv2aAckBusyBits();
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
