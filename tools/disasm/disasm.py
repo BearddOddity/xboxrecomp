@@ -210,7 +210,27 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    #
+                    # The other evidence is where the address sits: MSVC starts
+                    # functions on a 16-byte boundary and fills the gap before
+                    # it with int3. A frameless function (mov eax,[esp+0xC] ...)
+                    # has no prologue to recognise, but a 16-aligned seed right
+                    # after 0xCC padding is a function start the sweep ran
+                    # over, not a byte inside a mov. True Crime's 0x000FBDB0
+                    # and 0x000D5F70 are both reached only through function
+                    # pointers; rejected, every call to them failed to resolve,
+                    # and the dispatcher's miss left esp 12 bytes off in the
+                    # caller.
+                    # A 16-aligned seed that opens by reading a stack argument
+                    # (mov r32, [esp+disp8]: 8B /r with SIB 0x24) counts too:
+                    # 0x001AF6B0 follows its neighbour's switch table with no
+                    # padding in between.
+                    before = self.image.read_bytes_at_va(addr - 1, 1)
+                    head = self.image.read_bytes_at_va(addr, 3) or b""
+                    after_padding = addr % 16 == 0 and before == b"\xcc"
+                    reads_arg = (addr % 16 == 0 and len(head) == 3 and head[0] == 0x8B
+                                 and (head[1] & 0xC7) == 0x44 and head[2] == 0x24)
+                    if after_padding or reads_arg or self.engine.probes_as_prologue(addr):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(
