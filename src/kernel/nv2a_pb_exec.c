@@ -196,6 +196,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
 #define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
 #define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+#define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 shorts */
+#define NV097_SET_VERTEX_DATA4S_M         0x1980   /* + attr*8,  4 shorts */
 
 /* One immediate vertex, as this file packs it for the shared draw path:
  * position float4, diffuse D3DCOLOR, texcoord0 float2. */
@@ -412,6 +414,26 @@ static void note_unhandled(uint32_t method, uint32_t param)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+/* Each attribute's current value, from SET_VERTEX_DATA* (xemu: inline
+ * values). An attribute with no array reads this, not zero: D3D sets the
+ * diffuse colour of a mesh without a colour stream this way (white), and
+ * True Crime's lighting program multiplies by it -- read as zero, every lit
+ * surface in the first mission came out black. */
+static float s_attr_cur[NV_VERTEX_ATTRS][4];
+
+static void attr_cur_init(void)
+{
+    static int done;
+    int i;
+    if (done)
+        return;
+    done = 1;
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        s_attr_cur[i][0] = s_attr_cur[i][1] = s_attr_cur[i][2] = 0.0f;
+        s_attr_cur[i][3] = 1.0f;
+    }
+}
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -420,8 +442,15 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    if (!a->size || !a->stride) {
+        /* No array: the current value. Still "not present" to callers that
+         * pick a stream by whether it exists. */
+        if (a >= s_gpu.attr && a < s_gpu.attr + NV_VERTEX_ATTRS) {
+            attr_cur_init();
+            memcpy(out, s_attr_cur[a - s_gpu.attr], 4 * sizeof(float));
+        }
         return 0;
+    }
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
@@ -545,7 +574,8 @@ static struct {
     uint32_t gen;                       /* per-batch cache stamp */
 } s_vp;
 
-typedef struct { float pos[4], d0[4], t0[4]; int ok; } VpOut;
+/* oPos, oD0, oT0..oT3, oD1, oFog: what the pixel pipeline reads. */
+typedef struct { float pos[4], d0[4], t0[4], t1[4], t2[4], t3[4], d1[4], fog[4]; int ok; } VpOut;
 
 /* Per-batch results by vertex index: a strip or an indexed mesh names most
  * vertices several times, and the program is the expensive part. */
@@ -652,7 +682,8 @@ static void vp_run(float v[16][4], VpOut *o)
 
     memset(r, 0, sizeof r);
     memset(out, 0, sizeof out);
-    out[3][3] = out[9][3] = 1.0f;
+    for (pc = 3; pc < 13; pc++)             /* xemu starts every output at 0,0,0,1 */
+        out[pc][3] = 1.0f;
 
     for (pc = s_vp.prog_start; pc < VP_SLOTS; pc++) {
         const uint32_t *t = s_vp.prog[pc];
@@ -749,7 +780,12 @@ static void vp_run(float v[16][4], VpOut *o)
     }
     memcpy(o->pos, r[12], sizeof o->pos);
     memcpy(o->d0, out[3], sizeof o->d0);
+    memcpy(o->d1, out[4], sizeof o->d1);
+    memcpy(o->fog, out[5], sizeof o->fog);
     memcpy(o->t0, out[9], sizeof o->t0);
+    memcpy(o->t1, out[10], sizeof o->t1);
+    memcpy(o->t2, out[11], sizeof o->t2);
+    memcpy(o->t3, out[12], sizeof o->t3);
     o->ok = o->pos[3] > 1e-6f && isfinite(o->pos[0]) && isfinite(o->pos[1])
          && isfinite(o->pos[3]);
 }
@@ -767,6 +803,35 @@ static const VpOut *vp_vertex(uint32_t index)
         fetch_attr(&s_gpu.attr[a], index, v[a]);
     o = index < VP_CACHE ? &s_vp_cache[index] : &uncached;
     vp_run(v, o);
+    {   /* RECOMP_VP_DUMP=<n>: the first n programs whose vertex came out with
+         * a black diffuse (oD0.rgb = 0): microcode, inputs and constants, to
+         * logs\vp-NNN.txt, for tools/vshdis.py. */
+        static int left = -1, seq;
+        if (left < 0) { const char *e = getenv("RECOMP_VP_DUMP"); left = e ? atoi(e) : 0; }
+        if (left > 0 && o->d0[0] == 0.0f && o->d0[1] == 0.0f && o->d0[2] == 0.0f) {
+            char path[64];
+            FILE *f;
+            uint32_t pc, k;
+            snprintf(path, sizeof path, "logs\\vp-%03d.txt", seq++);
+            left--;
+            if ((f = fopen(path, "w")) != NULL) {
+                fprintf(f, "start %u\n", s_vp.prog_start);
+                for (pc = s_vp.prog_start; pc < VP_SLOTS; pc++) {
+                    fprintf(f, "i %u %08X %08X %08X %08X\n", pc, s_vp.prog[pc][0], s_vp.prog[pc][1],
+                            s_vp.prog[pc][2], s_vp.prog[pc][3]);
+                    if (s_vp.prog[pc][3] & 1)
+                        break;
+                }
+                for (k = 0; k < 16; k++)
+                    fprintf(f, "v %u %g %g %g %g\n", k, v[k][0], v[k][1], v[k][2], v[k][3]);
+                for (k = 0; k < VP_CONSTS; k++)
+                    fprintf(f, "c %u %g %g %g %g\n", k, s_vp.c[k][0], s_vp.c[k][1], s_vp.c[k][2], s_vp.c[k][3]);
+                fprintf(f, "out pos %g %g %g %g d0 %g %g %g %g\n", o->pos[0], o->pos[1], o->pos[2], o->pos[3],
+                        o->d0[0], o->d0[1], o->d0[2], o->d0[3]);
+                fclose(f);
+            }
+        }
+    }
     {   /* RECOMP_VP_TRACE=1: once a second, one vertex through the program --
          * input position, result, and the viewport constants the XDK tail
          * uses (c[-38] and c[-37] = slots 58 and 59). */
@@ -1862,12 +1927,146 @@ static int backend_vertex(uint32_t index, Nv2aVertex *out)
  * ponytail: indices 64K apart that collide just recompute. */
 static struct { uint32_t batches, dark_lit; } s_vit;
 
+/* The pixel pipeline for a combiner-emulating back end (Nv2aBatch.ex /
+ * stages / comb). Decoded once per batch before its vertices, because a
+ * vertex's texture coordinates are normalised by its stage's texture. */
+static Nv2aTexture  s_stage_tex[4];
+static int          s_stage_on[4];
+static Nv2aCombiner s_comb;
+static Nv2aVertexEx s_bex[NV_BACKEND_MAX_VERTS];
+
+/* Texture stage i as programmed (stage 0 included, from the raw registers).
+ * Off unless its shader stage has a mode and CONTROL0 enables it. */
+static int stage_texture(int i, Nv2aTexture *t)
+{
+    const uint32_t *r = &s_tex_reg[16 * i];        /* 0x40 bytes per stage */
+    uint32_t mode = (s_reg[0x1E70 / 4] >> (5 * i)) & 0x1F;
+    uint32_t fmt = r[1];
+
+    if (!mode || mode == 4 || mode == 5 || !(r[3] & (1u << 30)) || !r[0])
+        return 0;                                  /* none, pass-through, clip plane */
+    if (fmt & 4)                                   /* cube map: not sampled yet */
+        return 0;
+    t->offset = dma_resolve(r[0]);
+    t->color = (fmt >> 8) & 0xFF;
+    if (tex_size_from_format(t->color)) {
+        t->width  = 1u << ((fmt >> 20) & 0xF);
+        t->height = 1u << ((fmt >> 24) & 0xF);
+        t->pitch  = 0;
+    } else {
+        t->width  = r[7] >> 16;                    /* IMAGE_RECT */
+        t->height = r[7] & 0xFFFF;
+        t->pitch  = r[4] >> 16;                    /* CONTROL1 */
+    }
+    t->addr_u =  r[2]       & 0xF;
+    t->addr_v = (r[2] >> 8) & 0xF;
+    return t->offset && t->width && t->height;
+}
+
+static void snapshot_pixel_pipeline(void)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        s_stage_on[i] = stage_texture(i, &s_stage_tex[i]);
+    s_comb.control = s_reg[0x1E60 / 4];
+    for (i = 0; i < 8; i++) {
+        s_comb.color_icw[i] = s_reg[(0x0AC0 + 4 * i) / 4];
+        s_comb.color_ocw[i] = s_reg[(0x1E40 + 4 * i) / 4];
+        s_comb.alpha_icw[i] = s_reg[(0x0260 + 4 * i) / 4];
+        s_comb.alpha_ocw[i] = s_reg[(0x0AA0 + 4 * i) / 4];
+        s_comb.factor0[i]   = s_reg[(0x0A60 + 4 * i) / 4];
+        s_comb.factor1[i]   = s_reg[(0x0A80 + 4 * i) / 4];
+    }
+    s_comb.final0 = s_reg[0x0288 / 4];
+    s_comb.final1 = s_reg[0x028C / 4];
+    s_comb.final_factor[0] = s_reg[0x1E20 / 4];
+    s_comb.final_factor[1] = s_reg[0x1E24 / 4];
+    s_comb.fog_color = s_reg[0x02A8 / 4];
+    s_comb.stage_program = s_reg[0x1E70 / 4];
+    s_comb.other_stage_input = s_reg[0x1E78 / 4];
+}
+
+/* The fog unit, as xemu's vertex shader models it: the distance (oFog.x
+ * for a program) through SET_FOG_MODE with SET_FOG_PARAMS. 1 = no fog. */
+static float fog_factor(float d)
+{
+    uint32_t mode = s_reg[0x029C / 4];
+    float p0 = reg_f(0x09C0), p1 = reg_f(0x09C4), f;
+
+    if (!s_reg[0x02A4 / 4])                        /* SET_FOG_ENABLE */
+        return 1.0f;
+    switch (mode) {
+    case 0x800: case 0x802:                        /* EXP, EXP_ABS */
+        if (isinf(d)) return mode == 0x800 ? 1.0f : 0.0f;
+        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f;
+        break;
+    case 0x801: case 0x803:                        /* EXP2, EXP2_ABS */
+        if (isinf(d)) return 0.0f;
+        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f;
+        break;
+    default:                                       /* LINEAR 0x2601, LINEAR_ABS 0x804 */
+        if (isinf(d)) return 1.0f;
+        f = p0 + d * p1 - 1.0f;
+        break;
+    }
+    if (mode == 0x802 || mode == 0x803 || mode == 0x804)
+        f = fabsf(f);
+    return isnan(f) ? 1.0f : f;
+}
+
+static void clamp01_4(float d[4], const float s[4])
+{
+    int k;
+    for (k = 0; k < 4; k++)
+        d[k] = isnan(s[k]) ? 1.0f : s[k] < 0.0f ? 0.0f : s[k] > 1.0f ? 1.0f : s[k];
+}
+
+static void backend_vertex_ex(uint32_t index, const Nv2aVertex *v, Nv2aVertexEx *x)
+{
+    static const float spec_off[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    int i;
+
+    if (batch_is_vp()) {
+        const VpOut *o = vp_vertex(index);
+        clamp01_4(x->d0, o->d0);
+        clamp01_4(x->d1, s_reg[0x03B8 / 4] ? o->d1 : spec_off);
+        x->fog = fog_factor(o->fog[0]);
+        memcpy(x->t[0], o->t0, sizeof x->t[0]);
+        memcpy(x->t[1], o->t1, sizeof x->t[1]);
+        memcpy(x->t[2], o->t2, sizeof x->t[2]);
+        memcpy(x->t[3], o->t3, sizeof x->t[3]);
+    } else {
+        uint32_t c = v->diffuse;
+        float d1[4];
+        x->d0[0] = ((c >> 16) & 0xFF) / 255.0f;
+        x->d0[1] = ((c >>  8) & 0xFF) / 255.0f;
+        x->d0[2] = ( c        & 0xFF) / 255.0f;
+        x->d0[3] = ((c >> 24) & 0xFF) / 255.0f;
+        if (s_reg[0x03B8 / 4] && fetch_attr(&s_gpu.attr[4], index, d1))
+            clamp01_4(x->d1, d1);
+        else
+            memcpy(x->d1, spec_off, sizeof x->d1);
+        /* ponytail: fixed-function fog from the eye distance (clip w);
+         * SET_FOG_GEN_MODE's radial and planar variants when a title needs them. */
+        x->fog = fog_factor(v->rhw != 0.0f ? fabsf(1.0f / v->rhw) : INFINITY);
+        for (i = 0; i < 4; i++)
+            fetch_attr(&s_gpu.attr[9 + i], index, x->t[i]);
+    }
+    /* A linear texture is addressed in texels: normalise s and t, leave q,
+     * so s/q and t/q stay the same projection. */
+    for (i = 0; i < 4; i++)
+        if (s_stage_on[i] && !tex_size_from_format(s_stage_tex[i].color)) {
+            x->t[i][0] /= (float)s_stage_tex[i].width;
+            x->t[i][1] /= (float)s_stage_tex[i].height;
+        }
+}
+
 #define NV_VCACHE 65536
-typedef struct { uint32_t gen, index; int ok; Nv2aVertex v; } VCacheEntry;
+typedef struct { uint32_t gen, index; int ok; Nv2aVertex v; Nv2aVertexEx x; } VCacheEntry;
 static VCacheEntry s_vcache[NV_VCACHE];
 static uint32_t s_vcache_gen;
 
-static int backend_vertex_cached(uint32_t index, Nv2aVertex *out)
+static int backend_vertex_cached(uint32_t index, Nv2aVertex *out, Nv2aVertexEx *ex)
 {
     VCacheEntry *e = &s_vcache[index & (NV_VCACHE - 1)];
 
@@ -1875,9 +2074,13 @@ static int backend_vertex_cached(uint32_t index, Nv2aVertex *out)
         e->gen = s_vcache_gen;
         e->index = index;
         e->ok = backend_vertex(index, &e->v);
+        if (e->ok)
+            backend_vertex_ex(index, &e->v, &e->x);
     }
-    if (e->ok)
+    if (e->ok) {
         *out = e->v;
+        *ex = e->x;
+    }
     return e->ok;
 }
 
@@ -1887,9 +2090,9 @@ static void backend_tri(uint32_t i0, uint32_t i1, uint32_t i2, void *ctx)
 
     if (*n + 3 > NV_BACKEND_MAX_VERTS)
         return;
-    if (backend_vertex_cached(i0, &s_bverts[*n])
-     && backend_vertex_cached(i1, &s_bverts[*n + 1])
-     && backend_vertex_cached(i2, &s_bverts[*n + 2]))
+    if (backend_vertex_cached(i0, &s_bverts[*n], &s_bex[*n])
+     && backend_vertex_cached(i1, &s_bverts[*n + 1], &s_bex[*n + 1])
+     && backend_vertex_cached(i2, &s_bverts[*n + 2], &s_bex[*n + 2]))
         *n += 3;
 }
 
@@ -1905,6 +2108,7 @@ static void backend_batch(void)
         s_vcache_gen = 1;
     }
 
+    snapshot_pixel_pipeline();
     for_each_triangle(backend_tri, &n);
     if (!n)
         return;
@@ -1997,6 +2201,13 @@ static void backend_batch(void)
     batch.count = n;
     batch.texture = NULL;
     batch.state = &s_gpu.rs;
+    batch.ex = s_bex;
+    batch.comb = &s_comb;
+    {
+        int k;
+        for (k = 0; k < 4; k++)
+            batch.stages[k] = s_stage_on[k] ? &s_stage_tex[k] : NULL;
+    }
     /* Back ends draw texture x colour. Follow a one-stage combiner program
      * that far: whether it reads texture 0 at all, and where its colour comes
      * from (the vertex V0, the constant factor0 C0, or neither = white).
@@ -2500,6 +2711,39 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
 {
     union { uint32_t u; float f; } v;
     v.u = param;
+
+    /* Every SET_VERTEX_DATA* write is also the attribute's current value,
+     * which an attribute without an array reads (s_attr_cur, see fetch_attr).
+     * Encodings as xemu's pgraph methods. */
+    attr_cur_init();
+    if (method >= NV097_SET_VERTEX_DATA2F_M && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
+        uint32_t off = (method - NV097_SET_VERTEX_DATA2F_M) / 4;
+        s_attr_cur[off / 2][off % 2] = v.f;
+        s_attr_cur[off / 2][2] = 0.0f;
+        s_attr_cur[off / 2][3] = 1.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA4F_M && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
+        uint32_t off = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
+        s_attr_cur[off / 4][off % 4] = v.f;
+    } else if (method >= NV097_SET_VERTEX_DATA4UB && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
+        float *c = s_attr_cur[(method - NV097_SET_VERTEX_DATA4UB) / 4];
+        c[0] = ( param        & 0xFF) / 255.0f;
+        c[1] = ((param >>  8) & 0xFF) / 255.0f;
+        c[2] = ((param >> 16) & 0xFF) / 255.0f;
+        c[3] = ((param >> 24) & 0xFF) / 255.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA2S && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4) {
+        float *c = s_attr_cur[(method - NV097_SET_VERTEX_DATA2S) / 4];
+        c[0] = (float)(int16_t)(param & 0xFFFF);
+        c[1] = (float)(int16_t)(param >> 16);
+        c[2] = 0.0f;
+        c[3] = 1.0f;
+        return 1;
+    } else if (method >= NV097_SET_VERTEX_DATA4S_M && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8) {
+        uint32_t off = (method - NV097_SET_VERTEX_DATA4S_M) / 4;
+        float *c = s_attr_cur[off / 2];
+        c[(off % 2) * 2]     = (float)(int16_t)(param & 0xFFFF);
+        c[(off % 2) * 2 + 1] = (float)(int16_t)(param >> 16);
+        return 1;
+    }
 
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
         uint32_t c = (method - NV097_SET_VERTEX4F) / 4;

@@ -14,10 +14,11 @@
  * end may create its window and device lazily on the first call and pump its
  * window messages from flip().
  *
- * ponytail: fixed-function and pre-transformed batches only; vertex-program
- * batches are still skipped (the executor does not run programs yet), and
- * blend/depth/combiner state is not passed on. Extend Nv2aBatch when those
- * land rather than adding callbacks.
+ * Pre-transformed, fixed-function and vertex-program batches all arrive
+ * transformed. Blend, depth and cull state ride in Nv2aRenderState; the
+ * pixel pipeline (all four texture stages and the register combiners) in
+ * the optional Nv2aBatch.ex / stages / comb. Extend Nv2aBatch rather than
+ * adding callbacks.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
@@ -65,11 +66,43 @@ typedef struct {
     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
 } Nv2aRenderState;
 
+/* What the NV2A's pixel pipeline sees per vertex, for a back end that
+ * emulates the register combiners rather than drawing texture x colour.
+ * Parallel to Nv2aBatch.vertices. Values follow xemu's vertex outputs:
+ * d0/d1 clamped to 0..1 (d1 is 0,0,0,1 with specular off); fog is the fog
+ * factor before the pixel stage clamps it (1 = no fog); t[] are the texture
+ * coordinates s t r q per stage, already divided by the texture size for a
+ * linear (texel-addressed) texture, so a back end samples t.xy / t.w. */
+typedef struct {
+    float d0[4], d1[4];
+    float fog;
+    float t[4][4];
+} Nv2aVertexEx;
+
+/* The pixel pipeline's registers as the title set them (Kelvin method
+ * values; see xemu's psh_regs.h for the encodings). */
+typedef struct {
+    uint32_t control;                   /* SET_COMBINER_CONTROL: stages | flags << 8 */
+    uint32_t color_icw[8], color_ocw[8];
+    uint32_t alpha_icw[8], alpha_ocw[8];
+    uint32_t factor0[8], factor1[8];    /* ARGB */
+    uint32_t final0, final1;            /* SET_COMBINER_SPECULAR_FOG_CW0/1 */
+    uint32_t final_factor[2];           /* SET_SPECULAR_FOG_FACTOR, ARGB */
+    uint32_t fog_color;                 /* SET_FOG_COLOR: R bits 0-7, G 8-15, B 16-23, A 24-31 */
+    uint32_t stage_program;             /* SET_SHADER_STAGE_PROGRAM: 5 bits per stage */
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT */
+} Nv2aCombiner;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Optional, for combiner-emulating back ends; a back end that draws
+     * texture x colour ignores them. NULL when the executor cannot say. */
+    const Nv2aVertexEx *ex;         /* per vertex, parallel to vertices */
+    const Nv2aTexture  *stages[4];  /* texture per stage; NULL = none bound */
+    const Nv2aCombiner *comb;
 } Nv2aBatch;
 
 typedef struct {
