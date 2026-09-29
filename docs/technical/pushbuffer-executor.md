@@ -126,16 +126,19 @@ Two things a back end has to get right once such vertices arrive:
 
 Some of the same meshes store normals that face away from the camera, and that
 is authentic: a write watch traced the road normal `(0, -1, 0.03)` to the
-title's file reader, and it equals `(v1-v0)×(v2-v0)` of the first triangle. The
-model-view matrix mirrors (determinant −1) and culling is off, so with
-`max(0, N·L)` those surfaces got only the ambient term. `lit_color` flips an
-eye-space normal that points away from the eye — two-sided lighting with the
-back material equal to the front.
+title's file reader (X-Men Legends), and it equals `(v1-v0)×(v2-v0)` of the
+first triangle. The model-view matrix mirrors (determinant −1) and culling is
+off, so with `max(0, N·L)` those surfaces got only the ambient term.
 
-The flip is per vertex, not per face, and what does this on hardware is not
-known: the title writes `0x17C4` (two-sided lighting) as 0, and xemu uses front
-colours only. Check against xemu or hardware if a surface ever looks lit from
-the wrong side.
+What makes such a mesh look right on hardware is not established: X-Men Legends
+writes `0x17C4` (two-sided lighting) as 0, and xemu uses front colours only. So
+by default `lit_color` lights the normal as stored. `RECOMP_FFP_FLIP_NORMALS`
+flips an eye-space normal that points away from the eye instead — two-sided
+lighting with the back material equal to the front, per vertex and not per
+face. It is a compatibility option, not hardware behaviour: a game project sets
+it for a mesh it has seen need it, so it cannot change how another title is
+lit. Check against xemu or hardware if a surface ever looks lit from the wrong
+side.
 
 ## Render Back Ends
 
@@ -158,3 +161,4 @@ Register-combiner state is not passed on yet.
 | `RECOMP_TRACE_FLIP=<n>` | dump 3000 batches starting at flip n, to inspect a given screen |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices |
 | `RECOMP_VP=0` | skip vertex-program batches instead of interpreting them |
+| `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |

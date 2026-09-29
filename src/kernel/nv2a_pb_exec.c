@@ -1672,6 +1672,16 @@ static int fetch_texcoord(uint32_t index, float out[2])
  * spot cones, no back-face colours, no skinning. Add them when a mesh looks
  * wrong rather than dark. */
 #define NV_LIGHTS 8
+/* RECOMP_FFP_FLIP_NORMALS: a compatibility option, off by default. See lit_color(). */
+static int ffp_flip_normals(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("RECOMP_FFP_FLIP_NORMALS") != NULL;
+    return on;
+}
+
 static int lit_color(uint32_t index, float out[4])
 {
     const float *mv = (const float *)&s_reg[0x0480 / 4];
@@ -1691,15 +1701,21 @@ static int lit_color(uint32_t index, float out[4])
     }
     len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
-    /* Light the side the viewer sees. Some meshes carry normals that face
-     * away from the camera (X-Men Legends' streets and sidewalks: authentic
-     * file data, drawn with culling off), and lighting them as stored left
-     * only the light's ambient term -- black ground. Flipping a normal that
-     * points away from the eye is two-sided lighting with the back material
-     * equal to the front one.
+    /* Optional (RECOMP_FFP_FLIP_NORMALS): light the side the viewer sees.
+     * Some meshes carry normals that face away from the camera (X-Men
+     * Legends' streets and sidewalks: authentic file data, drawn with culling
+     * off), and lighting them as stored leaves only the light's ambient term
+     * -- black ground. Flipping a normal that points away from the eye is
+     * two-sided lighting with the back material equal to the front one.
+     * This is NOT hardware behaviour: it applies even when the title left
+     * two-sided lighting off (NV097_SET_TWO_SIDE_LIGHT_EN, method 0x17C4, which
+     * X-Men Legends writes as 0), and how the hardware makes such a mesh look
+     * right is not established. So it is a compatibility option a game project
+     * turns on for meshes it has seen need it, and off otherwise, so it cannot
+     * change how any other title is lit.
      * ponytail: per vertex, not per face; exact for flat ground, a vertex on
      * a silhouette may pick the other side. */
-    if (n[0] * e[0] + n[1] * e[1] + n[2] * e[2] > 0.0f) {
+    if (ffp_flip_normals() && n[0] * e[0] + n[1] * e[1] + n[2] * e[2] > 0.0f) {
         n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2];
     }
 
