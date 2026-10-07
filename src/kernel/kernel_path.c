@@ -512,9 +512,17 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     }
 
     /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
-     * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
+     * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest.
+     *
+     * RECOMP_SAVE_SANDBOX=<dir> is the same, for test copies, when
+     * RECOMP_SAVE_DIR is not set: a test copy of a title and the player's copy
+     * share one game folder, and an XDK title deletes a save container it
+     * judges invalid. With either set, saves left in the game dir are not
+     * used (s_user_in_game stays 0), so the player's are never touched. */
     {
         const char *ov = getenv("RECOMP_SAVE_DIR");
+        if (!ov || !ov[0])
+            ov = getenv("RECOMP_SAVE_SANDBOX");
         /* Room for the longest suffix the rules append (UDATA\<title id>\
          * <save>\<file>); a longer root would only truncate later. */
         int n = (ov && ov[0])
