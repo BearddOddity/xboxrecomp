@@ -447,12 +447,24 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     return STATUS_INVALID_HANDLE;
 }
 
+/* Every delete a title asks for, always in the log: deletes are rare and the
+ * ones that matter remove saves. A title can set g_xbox_delete_hook to add its
+ * own call chain (which code decided to delete). */
+void (*g_xbox_delete_hook)(const wchar_t *host_path) = NULL;
+static void note_delete(const WCHAR *host_path)
+{
+    fprintf(stderr, "  [FILE] delete %S\n", host_path);
+    fflush(stderr);
+    if (g_xbox_delete_hook)
+        g_xbox_delete_hook(host_path);
+}
+
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     WCHAR win_path[MAX_PATH];
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
+    note_delete(win_path);
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -611,6 +623,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
+            if (info->DeleteFile) {
+                WCHAR p[MAX_PATH];
+                if (!GetFinalPathNameByHandleW(FileHandle, p, MAX_PATH, 0))
+                    wcscpy_s(p, MAX_PATH, L"(handle)");
+                note_delete(p);
+            }
             if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                          "SetFileDispositionInfo failed: err=%u", GetLastError());
