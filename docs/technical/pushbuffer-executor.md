@@ -231,6 +231,8 @@ when it matters rather than adding callbacks.
 | `RECOMP_PB_SCAN` | read-only survey of the pushbuffer; ranks what is not implemented |
 | `RECOMP_PB_EXEC` | execute it |
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
+| `RECOMP_PB_NOP_TRAP=0` | with the DMA walk on, stop trapping the software method (`NO_OPERATION` with a value); the default on the walk is to trap and deliver the GPU's interrupt; see [Software Methods](#software-methods) |
+| `RECOMP_TITLE_KEVENTS`, `RECOMP_VBLANK` | kernel switches the walk depends on (events a title builds itself; the GPU's vertical blank). Off by default, **on by default under `RECOMP_PB_WALK=dma`**; `=0` turns either off |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
@@ -251,5 +253,83 @@ under the walk on the first screen whose pushbuffer makes the walk long
 enough. Burnout 3 did, at its Crash Nav menu, with the main thread in
 `KeWaitForSingleObject` under D3D's fence wait.
 
-Turn the walk on for a project that delivers the GPU's software-method
-interrupt, or to bring up a title the segment scan draws wrongly.
+The runtime now delivers that interrupt when the walk is on -- see [Software
+Methods](#software-methods) below. Two kernel switches go with it and default on
+under the walk: `RECOMP_TITLE_KEVENTS`, because the event D3D sleeps on is one
+it builds itself rather than through `KeInitializeEvent`, and without a host
+event behind it the interrupt's `KeSetEvent` is lost and the fence wait spins
+for ever; and `RECOMP_VBLANK`, because once those events are real D3D's
+vertical-blank event is too, and nothing else sets it. Either can still be
+turned off with `=0`.
+
+With all three, Burnout 3 runs its Crash Nav menu and loads the garage car under
+the walk, as it does under the scan. The walk stays opt-in all the same: the
+segment scan does not trap the software method, so its behaviour is unchanged,
+and the walk has had less mileage. Turn it on to bring up a title the segment
+scan draws wrongly.
+
+## Software Methods
+
+`NO_OPERATION` (`0x0100`) with a non-zero parameter is not an operation the GPU
+performs. XDK D3D writes one into the pushbuffer when it wants the graphics
+interrupt -- a "signal me when you get here" marker. On hardware PGRAPH stops at
+the method, latches the method and its data in `PGRAPH_TRAPPED_ADDR`
+(`0x400704`, `0x100 | subchannel << 16`) and `PGRAPH_TRAPPED_DATA_LOW`
+(`0x400708`), sets the `NSOURCE` notification bit, raises the `ERROR` bit in
+`PGRAPH_INTR` (`0x400100` bit 20) and the `PGRAPH` bit in `PMC_INTR`
+(`0x000100` bit 12), and holds there until the driver has acknowledged the
+`ERROR` bit and re-enabled FIFO access (`PGRAPH_FIFO`, `0x400720` bit 0).
+
+XDK D3D's handler is the usual NVIDIA split. The ISR masks `PMC_INTR_EN`
+(`0x000140`) and queues a DPC. The DPC loops over the units with a bit in
+`PMC_INTR`; for PGRAPH it turns FIFO access off, reads `PGRAPH_INTR`, writes the
+value it read back to acknowledge it, hands the trapped data to its
+software-method switch -- which is where a swap is queued for the next vertical
+blank -- turns FIFO access back on, and returns `PGRAPH_INTR` read again. The
+DPC goes round again while that is non-zero, then restores `PMC_INTR_EN`. A
+title that waits on the swap for a fence, in `KeWaitForSingleObject` under D3D's
+fence code, sleeps forever if the interrupt never comes.
+
+The executor traps the method only when `nv2a_pb_dma_walk()` is on
+(`RECOMP_PB_WALK=dma`): `nv2a_pb_exec_method` (`src/kernel/nv2a_pb_exec.c`)
+hands `0x0100` with a value to `nv2a_pgraph_trap_nop`
+(`src/kernel/nv2a_pgraph_trap.c`). The segment scan never routes a kick's
+trailing software method there, so the default path is unchanged; and if
+`RECOMP_PB_NOP_TRAP=0`, no handler is connected on vector 3, or the title has not
+enabled the `ERROR` interrupt in `PGRAPH_INTR_EN` (`0x400140`), the method is
+left to the unhandled count exactly as before.
+
+The trap sets the registers above and raises vector 3 on a level line
+(`xbox_set_irq_line`, `src/kernel/kernel_bridge.c`), which the timer thread
+services by calling the connected ISR; the DPC it queues runs on the same
+thread straight after. The walk waits, as PGRAPH does, until the acknowledgement
+-- so a second trap can never overwrite `TRAPPED_DATA_LOW` before the handler has
+read the first. The wait is bounded at one second; a trap nobody answers is
+logged and dropped.
+
+The acknowledgement is the part plain memory cannot do. Against plain memory,
+writing back the value read changes nothing, the DPC reads `PGRAPH_INTR` still
+set, and it runs the same software method again, for ever, at `DISPATCH_LEVEL`.
+That queues the swap over and over, and because the guest never drops below
+`DISPATCH_LEVEL`, every USB interrupt is held off and the pad goes dead. So for
+the length of a trap the 4 KB PGRAPH register page is made read-only. Reads run
+at full speed against plain memory; a write faults, is single-stepped, and then
+has the register's semantics applied -- write-1-to-clear for `PGRAPH_INTR`, at
+whatever width the store was -- with `PMC_INTR`'s PGRAPH bit and the interrupt
+line following `PGRAPH_INTR & PGRAPH_INTR_EN`. It is the same trap the AC'97
+bus-master reset bits use in `src/kernel/xbox_memory_layout.c`. Nothing about it
+is title-specific: it is how the register behaves, whoever writes it. Outside a
+trap the page is plain memory, as it always was.
+
+While the trap is outstanding the busy-bit pass (`xbox_Nv2aAckBusyBits`), which
+otherwise holds `PMC_INTR` and `PGRAPH_INTR` at zero, leaves `PGRAPH_INTR` and
+`PMC_INTR`'s PGRAPH bit alone (`g_nv2a_intr_hold`, under `g_nv2a_intr_lock`) --
+and the waiting walk keeps running that pass. The walk's thread is the one that
+normally runs it, and D3D's deferred routine acknowledges a vertical blank and
+then spins until `PMC_INTR` bit 24 drops; with the walk blocked and the pass
+stopped, that routine never reached the trapped method and every trap ran out
+its one-second bound.
+
+The trap is Windows-only, like the AC'97 trap it follows; elsewhere it is off
+and the method is unhandled. `tests/nv2a_pgraph_trap` drives it with real page
+faults and a second thread playing the XDK handler.

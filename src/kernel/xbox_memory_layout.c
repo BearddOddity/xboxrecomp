@@ -1380,6 +1380,20 @@ static void framebuffer_probe_tick(void)
 #define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
 #define NV2A_ACK_PCRTC_INTR_0       0x600100u
 #define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
+/* The software-method trap (nv2a_pgraph_trap.c) holds a real pending bit in
+ * PGRAPH_INTR, and PMC_INTR's PGRAPH bit, while the title's handler deals with
+ * it, and gives PGRAPH_INTR its write-1-to-clear semantics for that time.
+ * Zeroing those here would take the bit away before the handler looks, so
+ * while the trap is outstanding they are left alone -- only those: the rest of
+ * PMC_INTR (the vertical blank's bit, which XDK D3D's deferred routine spins
+ * on) is still cleared, and the trap keeps calling this while it waits.
+ * g_nv2a_intr_lock is the lock the trap sets the hold under. */
+extern volatile LONG g_nv2a_intr_hold;
+extern SRWLOCK g_nv2a_intr_lock;
+
+#define SWM_PMC_INTR      0x000100u
+#define SWM_PMC_PGRAPH    0x00001000u
+#define SWM_PGRAPH_INTR   0x400100u
 
 /* Clear the request bits "hardware" would clear on its own.
  *
@@ -1396,10 +1410,22 @@ static void nv2a_ack_busy_bits(int flip_held)
 
     if (!regs)
         return;
+
+    AcquireSRWLockExclusive(&g_nv2a_intr_lock);
+
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
         uint32_t mask = NV2A_ACK[i].busy_mask;
+
+        /* While a software-method trap is outstanding, its pending bits must
+         * survive for the handler to read. */
+        if (g_nv2a_intr_hold) {
+            if (NV2A_ACK[i].offset == SWM_PGRAPH_INTR)
+                continue;
+            if (NV2A_ACK[i].offset == SWM_PMC_INTR)
+                mask &= ~SWM_PMC_PGRAPH;
+        }
         if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
             continue;
         /* Once the vblank is delivered its two bits belong to the
@@ -1419,6 +1445,8 @@ static void nv2a_ack_busy_bits(int flip_held)
         if (*r & mask)
             InterlockedAnd((volatile LONG *)r, (LONG)~mask);
     }
+
+    ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
 }
 
 void xbox_Nv2aAckBusyBits(void)

@@ -40,6 +40,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "nv2a_pgraph_trap.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -4112,6 +4113,17 @@ static void flip_hold_report(void)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+
+    /* NO_OPERATION with a value is a software method, trapped and handed to
+     * the title's interrupt handler (nv2a_pgraph_trap.c). Only the DMA walk
+     * delivers it; the segment scan never routes a kick's trailing software
+     * method here, so its behaviour is unchanged. If the trap is off or cannot
+     * be delivered, fall through so the method is counted unhandled, exactly
+     * as before this code existed. */
+    if (method == 0x0100 && param && nv2a_pb_dma_walk()) {
+        if (nv2a_pgraph_trap_nop(subch, param))
+            return;
+    }
 
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
