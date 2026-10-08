@@ -3028,13 +3028,26 @@ int xbox_VblankMode(const char *env, int paced_wanted)
 }
 
 extern int nv2a_pb_exec_flip_pacing(void);
+extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c */
+
+/* RECOMP_VBLANK, defaulting on under the pushbuffer's DMA walk: XDK D3D's
+ * interrupt handling waits on the vertical blank there (see
+ * walk_default_switch). Set to 0 it is off. */
+static const char *vblank_env(void)
+{
+    const char *e = getenv("RECOMP_VBLANK");
+
+    if (!e)
+        return nv2a_pb_dma_walk() ? "1" : NULL;
+    return strcmp(e, "0") ? e : NULL;
+}
 
 static int kernel_vblank_mode(void)
 {
     static volatile LONG mode = -1;
 
     if (mode < 0)
-        InterlockedExchange(&mode, xbox_VblankMode(getenv("RECOMP_VBLANK"),
+        InterlockedExchange(&mode, xbox_VblankMode(vblank_env(),
                                                    xbox_DispatchGateOn()
                                                    || nv2a_pb_exec_flip_pacing()));
     return (int)mode;
@@ -3261,6 +3274,18 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
 
 /* RECOMP_VBLANK without the 60 Hz schedule: v0.14.0's tick, unchanged. On
  * the timer thread's plain 10 ms loop, so about every 20 ms. */
+/* A switch the pushbuffer's DMA walk turns on by default. Set to 0 it is off,
+ * set to anything else on, and unset it follows RECOMP_PB_WALK=dma: under the
+ * walk XDK D3D's fence wait sleeps on an event it builds itself, set by the
+ * GPU's software-method interrupt (RECOMP_TITLE_KEVENTS), and its interrupt
+ * handling waits on the vertical blank too (RECOMP_VBLANK). Without either the
+ * walk freezes the title -- see pushbuffer-executor.md, "Software Methods". */
+static int walk_default_switch(const char *name)
+{
+    const char *e = getenv(name);
+    return e ? strcmp(e, "0") != 0 : nv2a_pb_dma_walk();
+}
+
 static void kernel_vblank_tick(void)
 {
     static long long next_ms, last_ms;
@@ -3298,6 +3323,64 @@ static void kernel_vblank_tick(void)
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+    }
+}
+
+/* Device interrupt lines, level-triggered, one bit per vector.
+ *
+ * A device model asserts its line; the timer thread wakes at once and calls
+ * the connected ISR, and keeps calling it each tick while the line stays up.
+ * The ISR acknowledges in the device's own status register, which is what
+ * lowers the line. The GPU raises vector 3 for a trapped software method and
+ * lowers it when the title's handler clears PGRAPH_INTR (nv2a_pgraph_trap.c).
+ */
+static volatile LONG g_irq_lines;
+static HANDLE        g_irq_event;
+
+static HANDLE irq_event(void)
+{
+    if (!g_irq_event) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (InterlockedCompareExchangePointer(&g_irq_event, e, NULL))
+            CloseHandle(e);
+    }
+    return g_irq_event;
+}
+
+void xbox_set_irq_line(uint32_t vector, int level)
+{
+    LONG bit = (LONG)(1u << vector);
+    LONG cur, next;
+
+    if (vector >= 32)
+        return;
+    do {
+        cur  = g_irq_lines;
+        next = level ? (LONG)((uint32_t)cur | (uint32_t)bit)
+                    : (LONG)((uint32_t)cur & ~(uint32_t)bit);
+    } while (InterlockedCompareExchange(&g_irq_lines, next, cur) != cur);
+    if (level) {
+        SetEvent(irq_event());
+        xbox_HostTimerWake();   /* the paced loop sleeps on its own timer */
+    }
+}
+
+static void kernel_service_irqs(void)
+{
+    static unsigned logged;
+    uint32_t v, lines = (uint32_t)g_irq_lines;
+
+    for (v = 0; lines; v++, lines >>= 1) {
+        int claimed;
+        if (!(lines & 1))
+            continue;
+        claimed = kernel_call_isr(v);
+        if (logged < 5) {
+            logged++;
+            fprintf(stderr, "  [KERNEL] irq %u -> ISR %s\n", v,
+                    claimed < 0 ? "not connected" : claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
     }
 }
 
@@ -3710,6 +3793,7 @@ static void kernel_timer_loop_ns(void)
          * drains at a raise runs now rather than at the next edge. */
         xbox_HostTimerSleepNs(wait);
         kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        kernel_service_irqs();            /* device interrupts, e.g. the GPU software method */
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now_ms = kernel_timer_clock_ms();
         kernel_fire_timers(now_ms, &timer_due);
@@ -3772,8 +3856,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             long long timer_due;
             int ran;
 
-            Sleep(10);
+            /* A device interrupt or 10 ms, whichever is first: the wake is
+             * for the GPU's trapped software method. */
+            WaitForSingleObject(irq_event(), 10);
             kernel_vblank_tick();  /* the GPU's frame clock */
+            kernel_service_irqs(); /* device interrupts, e.g. the GPU software method */
             kernel_drain_dpcs(&ran);
             kernel_fire_timers(kernel_timer_clock_ms(), &timer_due);
         }
@@ -7606,7 +7693,8 @@ static void ke_shadow_remove(uint32_t guest_va)
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
-/* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).
+/* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1; off by default,
+ * on by default under RECOMP_PB_WALK=dma, see walk_default_switch).
  *
  * Shadows are made by KeInitializeEvent, but XDK code can build a KEVENT by
  * writing its header directly: one title (T()NY) does not even import
@@ -7625,17 +7713,16 @@ static void ke_shadow_remove(uint32_t guest_va)
  * Opt-in because it changes what every such wait does: a wait that failed at
  * once now blocks until the event is set, and on a title whose setter the
  * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
- * hang. Turn it on for a title that waits on events it built itself. */
+ * hang. Turn it on for a title that waits on events it built itself. The DMA
+ * walk delivers the GPU interrupt that sets D3D's, so it turns this on too. */
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
     static int enabled = -1;
     uint32_t hdr, i;
     HANDLE h = NULL;
 
-    if (enabled < 0) {
-        const char *e = getenv("RECOMP_TITLE_KEVENTS");
-        enabled = e && *e == '1';
-    }
+    if (enabled < 0)
+        enabled = walk_default_switch("RECOMP_TITLE_KEVENTS");
     if (!enabled)
         return NULL;
     if (guest_va < 0x10000u || (guest_va & 3u))

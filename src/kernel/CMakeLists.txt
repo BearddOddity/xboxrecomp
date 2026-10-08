@@ -28,6 +28,7 @@ set(KERNEL_SOURCES
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_flip_hold.c
+    nv2a_pgraph_trap.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
 )

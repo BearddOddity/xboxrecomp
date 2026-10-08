@@ -35,7 +35,8 @@ void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pi
 void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
 static uint32_t s_fence_va;                           /* the mirrored fence word, if any */
 uint32_t xbox_Nv2aFenceWordVa(void) { return s_fence_va; }
-int nv2a_pb_dma_walk(void) { return 1; }             /* RECOMP_PB_WALK=dma: 0x0310 is latched */
+static int s_walk_on = 1;                            /* RECOMP_PB_WALK=dma */
+int nv2a_pb_dma_walk(void) { return s_walk_on; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
@@ -53,6 +54,17 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
     return offset == 0x400B10u ? &s_pgraph_400b10 : NULL;
 }
 
+/* The software-method trap (nv2a_pgraph_trap.c, tested on its own in
+ * tests/nv2a_pgraph_trap): here only who reaches it, and with what. */
+static int s_trap_ret = 1, s_trap_n;
+static uint32_t s_trap_subch, s_trap_param;
+int nv2a_pgraph_trap_nop(uint32_t subch, uint32_t param)
+{
+    s_trap_n++;
+    s_trap_subch = subch;
+    s_trap_param = param;
+    return s_trap_ret;
+}
 /* ---- the fake back end ------------------------------------------------- */
 static struct {
     int draws, clears, flips;
@@ -276,6 +288,37 @@ int main(void)
     CHECK(s_be.flips == 0);
     m(0x0130, 0);                                     /* FLIP_STALL */
     CHECK(s_be.flips == 1);
+
+    /* The software method. NO_OPERATION with a value, under the DMA walk, goes
+     * to the trap with its subchannel and data, and to nothing else (the back
+     * end sees no extra draw or clear). */
+    {
+        int draws = s_be.draws, clears = s_be.clears;
+
+        s_trap_n = 0;
+        nv2a_pb_exec_method(5, 0x0100, 5);
+        CHECK(s_trap_n == 1 && s_trap_subch == 5 && s_trap_param == 5);
+
+        /* NO_OPERATION with no value is a real no-op, not a trap. */
+        nv2a_pb_exec_method(0, 0x0100, 0);
+        CHECK(s_trap_n == 1);
+
+        /* With the walk off the method never reaches the trap: the default
+         * path stays as it was. */
+        s_walk_on = 0;
+        nv2a_pb_exec_method(5, 0x0100, 7);
+        CHECK(s_trap_n == 1);
+        s_walk_on = 1;
+
+        /* A trap that is off or cannot be delivered hands the method back,
+         * and it is counted unhandled as before. */
+        s_trap_ret = 0;
+        nv2a_pb_exec_method(5, 0x0100, 9);
+        CHECK(s_trap_n == 2 && s_trap_param == 9);
+        s_trap_ret = 1;
+
+        CHECK(s_be.draws == draws && s_be.clears == clears);
+    }
 
     if (!s_fail)
         printf("nv2a fixed-function path through a back end: ok\n");

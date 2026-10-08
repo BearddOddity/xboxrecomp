@@ -105,3 +105,4 @@ Where to look when a title does something and says nothing about why.
 | runs out of memory as the CRT heap grows | [The Heap Grows Only on 487](technical/kernel-replacement.md#the-heap-grows-only-on-487) |
 | slows to 1 FPS some minutes into a level | [Counters Outlive 32 Bits](technical/kernel-replacement.md#counters-outlive-32-bits) |
 | reports ABI violations in CRT helpers | [Reports RECOMP_ABI_CHECK Always Gives](pipeline/06-debugging.md#reports-recomp_abi_check-always-gives) |
+| freezes in D3D's fence wait under `RECOMP_PB_WALK=dma`, or runs with a dead pad and `[OHCI0] guest IRQL never dropped` | [Software Methods](technical/pushbuffer-executor.md#software-methods) |
