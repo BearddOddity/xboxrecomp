@@ -212,6 +212,9 @@ static void pb_flow(uint32_t at, uint32_t w, uint32_t to)
     s_flow_n++;
 }
 
+static void pb_desync_probe(const uint8_t *mem, uint32_t at, uint32_t w,
+                            uint32_t put);
+
 static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
 {
     static unsigned total;
@@ -219,8 +222,11 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
     if (target < PB_RAM_BYTES)
         return 0;
     if (++total <= 16 || total % 100 == 0) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+
         fprintf(stderr, "  [PB] bad target #%u 0x%08X from word 0x%08X at 0x%08X"
                         " (PUT 0x%08X); resync\n", total, target, w, at, put);
+        pb_desync_probe(mem, at, w, put);
         if (total <= 4)
             for (k = 0; k < PB_HIST && k < s_hist_n; k++) {
                 unsigned i = (s_hist_n - 1 - k) % PB_HIST;
@@ -257,8 +263,70 @@ static int      s_pend_noninc;
  * that is not what it last wrote means the title moved it, and the walk
  * follows. */
 extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+#define NV2A_USER_DMA_PUT 0x800040u
 #define NV2A_USER_DMA_GET 0x800044u
 static uint32_t s_pub = 0xFFFFFFFFu;
+
+/* GET as the walk left it, for the poll thread: the PUT it read is stale by
+ * the time a long walk ends (the walk stops at the live writer, which can be
+ * lower), and writing the stale value over GET would tell the title the
+ * commands between the two were consumed when they were not. Under the survey
+ * walk there is no publishing and no consumption, so the caller's value
+ * stands. */
+uint32_t nv2a_pb_walk_end(uint32_t fallback)
+{
+    if (!pb_walk_enabled() || !s_exec_enabled || s_pub == 0xFFFFFFFFu)
+        return fallback;
+    return s_pub;
+}
+
+/* Did the last executed walk finish its segment? The poll thread mirrors the
+ * title's "submitted" fence into its "consumed" word every pass; hardware
+ * raises that mirror only when the GPU has actually run everything up to the
+ * fence, so the title reuses a pushbuffer -- a RenderWare geometry buffer
+ * behind a CALL, say -- only once the engine has read it. A mirror ticked
+ * while the walk is still mid-segment lets the title overwrite the buffer the
+ * walk is inside, and the walk then reads the new mesh's vertex indices as
+ * command headers. Under the walk the mirror ticks only between finished
+ * segments; the word-budget guard, the lost-sync snap and the bad-target
+ * resync all end a pass that skipped unread commands, and they say so. */
+static int s_caught_up = 1;
+
+int nv2a_pb_caught_up(void)
+{
+    return s_caught_up;
+}
+
+/* On a desync, the question is whether the ring's words are still the words
+ * the walk read. s_hist holds the last headers, so their addresses can be
+ * re-read and compared: a word that changed was written by the title while
+ * the walk was in the buffer, which is a lost-command race, not a misparse.
+ * The register values say which lap the walk was aiming at. */
+static void pb_desync_probe(const uint8_t *mem, uint32_t at, uint32_t w,
+                            uint32_t put)
+{
+    volatile uint32_t *regs = xbox_Nv2aRegPtr(0);
+    unsigned k;
+
+    fprintf(stderr, "  [PB]   probe: PUT reg now 0x%08X (walk aimed at 0x%08X)"
+                    "  GET reg now 0x%08X  in_call %d  ret 0x%08X\n",
+            regs ? *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT) : 0u,
+            put,
+            regs ? *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) : 0u,
+            s_in_call, s_ret);
+    fprintf(stderr, "  [PB]   word 0x%08X at 0x%08X now reads 0x%08X%s\n",
+            w, at, *(const uint32_t *)(mem + (0x80000000u | (at & PB_PHYS_MASK))),
+            *(const uint32_t *)(mem + (0x80000000u | (at & PB_PHYS_MASK))) == w
+                ? "" : "  (CHANGED)");
+    for (k = 0; k < PB_HIST && k < s_hist_n; k++) {
+        unsigned i = (s_hist_n - 1 - k) % PB_HIST;
+        uint32_t now = *(const uint32_t *)(mem + (0x80000000u |
+                                                  (s_hist[i].at & PB_PHYS_MASK)));
+        if (now != s_hist[i].w)
+            fprintf(stderr, "  [PB]   ring word rewritten since read: 0x%08X "
+                            "0x%08X -> 0x%08X\n", s_hist[i].at, s_hist[i].w, now);
+    }
+}
 
 /* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
  * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
@@ -300,18 +368,60 @@ void nv2a_pb_scan(uint32_t put_phys)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t put = put_phys & PB_PHYS_MASK;
     volatile uint32_t *get_reg = NULL;
+    volatile uint32_t *put_reg = NULL;
     uint32_t words = 0, jumps = 0, unknown = 0;
 
     if (!pb_walk_enabled())
         return;
+    if (s_exec_enabled) {
+        get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
+        put_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_PUT);
+    }
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
-        s_get = put, s_pend_left = 0;
+        s_get = put;
+        s_pend_left = 0;
+        s_pub = s_get;
+        if (get_reg)
+            *get_reg = s_get;                 /* the poll's read-back needs it */
         return;
     }
-    if (s_exec_enabled)
-        get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
 
+    /* DMA_PUT is where the title's writer has got to; the engine stops when
+     * GET reaches it, and never fetches at or past it. The walk took PUT once,
+     * when the poll thread called it. During a long walk -- a level load,
+     * thousands of kickoffs -- the title moves PUT: it wraps (PUT drops to the
+     * ring's start, and the walk follows the ring's JUMP around to it), or
+     * XDK D3D resets the ring from CDevice::KickOff's restart path (GET moves
+     * with it, and the GET check below follows it). Walking to the stale PUT
+     * runs past the live writer into space the title is writing for the next
+     * lap, and takes two 16-bit vertex indices whose low bits are 1 or 2 for
+     * a JUMP or CALL header -- the garage desync, measured as [PB] bad target
+     * with "ring word rewritten since read".
+     *
+     * So the aim only ever moves BACK to the live PUT; it is not chased
+     * forward. Chasing was tried: with the poll thread's 4 ms pass, a level
+     * load moves PUT faster than a software rasteriser walks, the walk ends
+     * its word budget mid-chase, snaps GET to the PUT it never read, and the
+     * title's KickOff spins for a latch no one set -- Burnout 3 dead at boot,
+     * GET == PUT on the log, no [PB] lines at all. A PUT that moved forward
+     * is the next pass's business: the poll thread sees PUT != last_put and
+     * calls the walk again from where this one stopped. */
+#define PB_LIVE_PUT()                                            \
+    do {                                                         \
+        if (put_reg) {                                           \
+            uint32_t p = *put_reg & PB_PHYS_MASK;                \
+            if (p != put && (int32_t)(p - put) < 0)              \
+                put = p;                                         \
+        }                                                        \
+    } while (0)
+
+    PB_LIVE_PUT();
     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
+
+    /* Every way out of the loop that did not read everything to the aim says
+     * so: a mirror the poll thread ticks after such a pass would tell the
+     * title the skipped commands were consumed. */
+    int clean = 1;
 
     while (s_get != put) {
         uint32_t at, target;
@@ -326,11 +436,15 @@ void nv2a_pb_scan(uint32_t put_phys)
                 s_in_call = 0;
                 s_pend_left = 0;
                 s_pub = s_get;
+                PB_LIVE_PUT();
                 continue;
             }
             *get_reg = s_get;
             s_pub = s_get;
         }
+        PB_LIVE_PUT();
+        if (s_get == put)
+            break;                            /* the live writer caught us */
         at = s_get;
 
         /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
@@ -338,6 +452,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
+            clean = 0;
             s_get = put, s_pend_left = 0;
             break;
         }
@@ -354,7 +469,7 @@ void nv2a_pb_scan(uint32_t put_phys)
 
         if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
             target = w & 0x1FFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { clean = 0; s_get = put, s_pend_left = 0; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -362,7 +477,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 1u) {                            /* jump */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { clean = 0; s_get = put, s_pend_left = 0; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -370,7 +485,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 2u) {                            /* call */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { clean = 0; s_get = put, s_pend_left = 0; break; }
             if (s_in_call) {
                 /* One level only: the hardware raises a CALL error and stops
                  * the pusher. Taking it would overwrite the return address
@@ -421,6 +536,10 @@ void nv2a_pb_scan(uint32_t put_phys)
         *get_reg = s_get;
         s_pub = s_get;
     }
+    /* A method stalled inside PUT has unread parameters: the commands are not
+     * finished, so the pass does not count as caught up. */
+    if (s_exec_enabled)
+        s_caught_up = clean && s_pend_left == 0;
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;

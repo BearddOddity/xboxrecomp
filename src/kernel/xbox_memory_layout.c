@@ -1501,8 +1501,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * lost-command race.
          *
          * The advance now happens after the scan, further down, which is
-         * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
+         * also the only ordering that gives the title real back-pressure.
+         *
+         * Under the DMA walk, the mirror waits for a finished segment. The
+         * tick says "the GPU has run everything up to the title's submitted
+         * fence"; a walk that is still mid-segment has not, and the title
+         * takes that as permission to reuse a pushbuffer -- a RenderWare
+         * geometry buffer behind a CALL -- while the walk is inside it. The
+         * walk then reads the next mesh's vertex indices as command headers
+         * (the garage desync: [PB] bad target, the target rewritten since
+         * the walk read it, GET inside the CALL). Hardware mirrors a fence
+         * as the engine completes it, in order, so the tick is gated on
+         * nv2a_pb_caught_up() and the segment scan keeps ticking as before. */
+        {
+            extern int nv2a_pb_caught_up(void);
+            extern int nv2a_pb_dma_walk(void);
+            if (!nv2a_pb_dma_walk() || nv2a_pb_caught_up())
+                fence_mirrors_tick();
+        }
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
@@ -1610,13 +1626,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
+                /* Consumed, now that it has actually been executed.
+                 *
+                 * Under the walk the PUT read above is stale by the time a
+                 * long walk ends: the walk stops at the live writer, which can
+                 * be lower when the title wrapped the ring underneath it.
+                 * Writing the stale value over GET tells the title the
+                 * commands between the two were consumed when they were not,
+                 * and it reuses the space while the walk still has to read it.
+                 * Ask the walk where it actually got to. */
                 {
+                    extern uint32_t nv2a_pb_walk_end(uint32_t);
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
-                    *get = put;
-                    get_written = put;
+                    uint32_t consumed = nv2a_pb_dma_walk()
+                                            ? nv2a_pb_walk_end(put) : put;
+                    *get = consumed;
+                    get_written = consumed;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
