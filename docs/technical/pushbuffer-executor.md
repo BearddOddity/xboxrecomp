@@ -35,16 +35,31 @@ two-instruction pre-transformed program (`mov oPos, v0; mov oT0, v9`).
 `nv2a_pb_scan.c` now keeps its own GET — a physical address, like the register
 — and walks the way the DMA engine does: it follows `JUMP` (old and new style),
 `CALL` and `RETURN` (one level of subroutine, as on NV2A), and stops when GET
-reaches PUT. The ring's wrap is itself a JUMP back to the start, so following
-it replaces learning the ring's bounds. A jump or call outside RAM means the
-walk is out of step; it snaps GET to PUT and logs `[PB] bad target ...` with
-the last commands it decoded. If the title moves GET itself (XDK D3D resets the
-ring by writing `DMA_PUT` and `DMA_GET` together) the walker resyncs, and it
-starts at the title's first GET, so device state sent before the first
-kickoff — the depth function, for one — is not lost.
+reaches PUT. The PUT it stops at is re-read from the register every command,
+and only ever moved back to the live writer: a level load moves PUT while a
+walk is running (the title wraps the ring, or `CDevice::KickOff`'s restart
+writes a fresh GET/PUT pair), and walking on to the PUT read before the walk
+runs past the live writer into words the title is writing for the next lap —
+a pair of 16-bit vertex indices whose low bits are 1 or 2 decodes as a JUMP or
+CALL. That was the garage desync: `[PB] bad target`, and the desync's dump
+shows the ring words the walk had read rewritten underneath it. A PUT that
+moved *forward* is not chased: the poll thread reads PUT every pass, and the
+next pass continues from where this one stopped. The ring's wrap is itself a
+JUMP back to the start, so following it replaces learning the ring's bounds.
+A jump or call outside RAM means the walk is out of step; it snaps GET to PUT
+and logs `[PB] bad target ...` with the last commands it decoded, the live
+register values, and any ring word it had read that has since changed. If the
+title moves GET itself (XDK D3D resets the ring by writing `DMA_PUT` and
+`DMA_GET` together) the walker resyncs, and it starts at the title's first
+GET, so device state sent before the first kickoff — the depth function, for
+one — is not lost.
 
 `tests/nv2a_pb_walk` checks the walk with a stubbed executor: `CALL` and
-`RETURN`, `JUMP`, non-increasing methods, a resync, and a bad target.
+`RETURN`, `JUMP`, non-increasing methods, a resync, a bad target, and a PUT
+that moves under the walk — forward, where the walk stops at what it was
+given and the next pass reads on, and backwards, where the walk follows the
+ring's JUMP to the new lap and stops at the live PUT without reading what
+lies past it.
 
 ## Answering the Title While It Runs
 
@@ -63,7 +78,14 @@ the thread that would otherwise answer.
   ticked only between passes lags the title by a whole walk. D3D then takes its
   fence wait, which a mirrored fence cannot satisfy (Burnout 3 hung there at its
   first menu). `xbox_Nv2aAckBusyBits` ticks the mirrors as well, so they keep
-  pace from inside the walk.
+  pace from inside the walk. Under the DMA walk a mirror is only raised when
+  the last walk *finished its segment*: hardware raises the mirror as the
+  engine completes the fence, and the title takes the mirror as permission to
+  reuse a pushbuffer — a RenderWare geometry buffer behind a `CALL`, the case
+  that desynced the garage — while the walk is still reading it. A pass that
+  snapped to PUT (lost sync, bad target, the word-budget guard) has skipped
+  unread commands and says so with `nv2a_pb_caught_up()`; the segment scan
+  still mirrors every pass, as before.
 - **Semaphore.** `BACK_END_WRITE_SEMAPHORE_RELEASE` (`0x1D70`) writes its value
   where `nv2a_pb_set_semaphore_target()` was told, once everything before it
   has run. `SET_SEMAPHORE_OFFSET` is not added: in *X-Men Legends* it held
