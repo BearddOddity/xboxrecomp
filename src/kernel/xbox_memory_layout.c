@@ -1411,6 +1411,32 @@ volatile LONG g_nv2a_vblank_latch;
 #define VBL_MARKER        0x80000000u
 #define VBL_PMC_PCRTC     (1u << 24)
 
+/* Flip pacing (RECOMP_PB_FLIP_PACE, a per-title opt-in; see flip_stall in
+ * nv2a_pb_exec.c). PGRAPH_INCREMENT (0x40071C) bit 1, READ_3D: the title's
+ * vblank handler sets it when it has put a swapped buffer on screen, and on
+ * hardware that advances PGRAPH's flip read index, which is what ends a
+ * FLIP_STALL. The executor keeps the index; this counts the writes for it.
+ * Off, the bit is left exactly as the title wrote it. */
+volatile LONG g_nv2a_flip_read_incs;
+
+static void nv2a_flip_increments(volatile uint32_t *regs)
+{
+    static int on = -1;
+    volatile uint32_t *inc;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_FLIP_PACE");
+        on = e && strcmp(e, "0") != 0;
+    }
+    if (!on)
+        return;
+    inc = (volatile uint32_t *)((char *)regs + 0x40071Cu);
+    if (*inc & 2u) {
+        *inc &= ~2u;
+        InterlockedIncrement(&g_nv2a_flip_read_incs);
+    }
+}
+
 /* Clear the request bits "hardware" would clear on its own.
  *
  * Also called by the pushbuffer walker between commands. This thread executes
@@ -1428,6 +1454,7 @@ static void nv2a_ack_busy_bits(int flip_held)
         return;
 
     AcquireSRWLockExclusive(&g_nv2a_intr_lock);
+    nv2a_flip_increments(regs);
 
     int vbl_hold = 0;
     if (g_nv2a_vblank_latch) {
