@@ -17,6 +17,8 @@ Two rules decide what may live in shared code:
 |---|---|---|---|
 | `RECOMP_PB_EXEC` | off | NV2A pushbuffer executor and render back-end interface | `src/kernel/nv2a_pb_scan.c`, `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_USB` | off | USB (OHCI) gamepad model | `src/usb/ohci.c` |
+| `RECOMP_VBLANK` | off (on under `RECOMP_PB_WALK=dma`) | raise the GPU's vertical blank at about 60 Hz to the title's ISR | `src/kernel/kernel_bridge.c` |
+| `RECOMP_VBLANK_LATCH` | off | with `RECOMP_VBLANK`: keep the raised vblank pending until the title acknowledges it. The NV2A ack thread otherwise zeroes it before XDK D3D's deferred routine reads it, and the vblank handler is skipped. | `src/kernel/kernel_bridge.c`, `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_HEAP_RECLAIM` | off | kernel memory: reclaim freed guest heap | `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_EXT_VMA` | off | kernel memory: extended virtual-memory areas | `src/kernel/guest_vmem.c`, `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_GUEST_LOCK` | off | kernel events: guest-side lock | `src/kernel/kernel_bridge.c` |
