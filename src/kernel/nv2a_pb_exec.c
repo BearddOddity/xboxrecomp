@@ -2015,6 +2015,13 @@ static int backend_wants_pipeline(void)
     return s_backend && (s_backend->flags & NV2A_BACKEND_WANT_PIPELINE);
 }
 
+/* Draws, and clips behind the eye itself (see NV2A_BACKEND_CLIPS_HOMOGENEOUS). */
+static int backend_clips_homogeneous(void)
+{
+    return s_backend && s_backend->draw
+        && (s_backend->flags & NV2A_BACKEND_CLIPS_HOMOGENEOUS);
+}
+
 static Nv2aVertex *backend_slot(void)
 {
     if (!s_bverts
@@ -2792,7 +2799,14 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.a = a; T.b = b; T.c = c;
     if (T.bpp != 4 && T.bpp != 2)
         return;
-    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+    if (backend_clips_homogeneous()) {
+        /* The back end clips behind the eye itself: keep the signed w, drop
+         * only a vertex it cannot invert. */
+        if (fabsf(a[3]) <= 1e-6f || fabsf(b[3]) <= 1e-6f || fabsf(c[3]) <= 1e-6f) {
+            s_gpu.tris_behind++;
+            return;
+        }
+    } else if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
         s_gpu.tris_behind++;
         return;
     }
@@ -2975,7 +2989,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                 inside = 0;
         }
     }
-    if (inside) {
+    if (inside || backend_clips_homogeneous()) {   /* a back end clips for itself */
         raster_xf_triangle(a, b, c);
         return;
     }
