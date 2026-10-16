@@ -56,6 +56,9 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# Immediate-mode GUI and runtime overlay (ported from xboxrecomp-reloaded for the T()ny build)
+add_subdirectory(src/gui)
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -68,6 +71,7 @@ set(XBOXRECOMP_LIBS
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_gui
 )
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
