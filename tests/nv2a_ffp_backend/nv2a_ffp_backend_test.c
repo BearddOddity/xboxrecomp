@@ -265,6 +265,30 @@ int main(void)
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
 
+    /* A triangle strip of four vertices is two triangles. With
+     * RECOMP_STRIP_ALT_WINDING the second one (odd) is emitted with its first two
+     * vertices swapped so it winds like the first; without it the strip's order
+     * is kept (the test runs once each way). Vertex 3 is at (1, 1). */
+    {
+        const int alt = getenv("RECOMP_STRIP_ALT_WINDING") != NULL;
+
+        putf(0x2024, 1); putf(0x2028, 1); putf(0x202C, 0);
+        put32(0x300C, 0xFF804020u);
+        putf(0x4024, 0); putf(0x4028, 0); putf(0x402C, 1);
+        m(0x176C, 0 | (4 << 4) | (4 << 8));          /* attr 3: D3DCOLOR again */
+        m(0x17FC, 6); m(0x1810, 3u << 24); m(0x17FC, 0);       /* TRIANGLE_STRIP, 4 vertices */
+        CHECK(s_be.count == 6);
+        /* triangle 0 is vertices 0 1 2 either way */
+        CHECK(near_(s_be.v[0].x, 0.0f)   && near_(s_be.v[1].x, 640.0f) && near_(s_be.v[2].x, 320.0f));
+        if (alt) {                                   /* triangle 1: 2 1 3 */
+            CHECK(near_(s_be.v[3].x, 320.0f) && near_(s_be.v[4].x, 640.0f) && near_(s_be.v[5].x, 640.0f));
+            CHECK(near_(s_be.v[3].y, 0.0f)   && near_(s_be.v[4].y, 480.0f) && near_(s_be.v[5].y, 0.0f));
+        } else {                                     /* triangle 1: 1 2 3 */
+            CHECK(near_(s_be.v[3].x, 640.0f) && near_(s_be.v[4].x, 320.0f) && near_(s_be.v[5].x, 640.0f));
+            CHECK(near_(s_be.v[3].y, 480.0f) && near_(s_be.v[4].y, 0.0f)   && near_(s_be.v[5].y, 0.0f));
+        }
+    }
+
     /* A vertex program, run on a back end that takes vertex-program batches
      * untransformed (draw_vp): an input the program reads that has no array
      * reads its current value, the one the last SET_VERTEX_DATA4UB wrote, when

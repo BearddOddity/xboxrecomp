@@ -17,3 +17,7 @@ add_test(NAME nv2a-ffp-backend COMMAND nv2a-ffp-backend-test)
 # the title opts in (RECOMP_VERTEX_CURRENT_ATTRS); the test above checks both.
 add_test(NAME nv2a-ffp-backend-current-attrs COMMAND nv2a-ffp-backend-test)
 set_tests_properties(nv2a-ffp-backend-current-attrs PROPERTIES ENVIRONMENT "RECOMP_VERTEX_CURRENT_ATTRS=1")
+# Triangle strips alternate their winding only with RECOMP_STRIP_ALT_WINDING; the same test
+# checks the unchanged order without it (the first test above) and the swapped one with it.
+add_test(NAME nv2a-ffp-backend-strip-winding COMMAND nv2a-ffp-backend-test)
+set_tests_properties(nv2a-ffp-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")
