@@ -3212,6 +3212,225 @@ static void raster_batch_program(void)
         backend_flush(!s_xf_no_tex);
 }
 
+/* ── Vertex programs on the GPU ─────────────────────────────────────────
+ *
+ * With NV2A_BACKEND_GPU_VERTEX_PROGRAMS the back end runs the program itself,
+ * so none of the per-vertex CPU work above is needed for these batches: the
+ * executor expands the primitive into an indexed triangle list, gathers each
+ * distinct vertex's program inputs once (only the inputs the microcode
+ * reads), and passes the microcode and the constants along (Nv2aVpBatch in
+ * nv2a_backend.h). Off with RECOMP_GPU_VP=0, and for anything it cannot
+ * express (no program loaded, vertex indices past 64 K), which then takes the
+ * CPU route unchanged. */
+typedef struct {
+    float *attrs;
+    uint32_t *idx;
+    uint32_t mask, floats, nv, ni;
+    int overflow;
+} GvpCtx;
+
+#define GVP_MAX_IDX (NV_MAX_INDICES * 3)
+static float    *s_gvp_attrs;                    /* allocated on first use */
+static uint32_t *s_gvp_idx;
+static uint32_t *s_gvp_slot_gen, *s_gvp_slot;
+static uint32_t  s_gvp_gen;
+
+static void gvp_add(GvpCtx *c, uint32_t index)
+{
+    if (index >= NV_MAX_INDICES) {
+        c->overflow = 1;
+        return;
+    }
+    if (s_gvp_slot_gen[index] != s_gvp_gen) {
+        float *dst = c->attrs + (size_t)c->nv * c->floats;
+        uint32_t a;
+        for (a = 0; a < NV_VERTEX_ATTRS; a++)
+            if (c->mask & (1u << a)) {
+                fetch_attr(&s_gpu.attr[a], index, dst);
+                dst += 4;
+            }
+        s_gvp_slot_gen[index] = s_gvp_gen;
+        s_gvp_slot[index] = c->nv++;
+    }
+    c->idx[c->ni++] = s_gvp_slot[index];
+}
+
+static void gvp_tri(GvpCtx *c, uint32_t i0, uint32_t i1, uint32_t i2)
+{
+    if (c->ni + 3 > GVP_MAX_IDX) {
+        c->overflow = 1;
+        return;
+    }
+    gvp_add(c, i0);
+    gvp_add(c, i1);
+    gvp_add(c, i2);
+}
+
+/* The batch's primitive as triangles, in the order the CPU route draws them. */
+static void gvp_expand(GvpCtx *c)
+{
+    const uint32_t *ix = s_gpu.idx;
+    uint32_t i, n = s_gpu.idx_count;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++)
+            gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            gvp_tri(c, ix[0], ix[i], ix[i + 1]);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
+            gvp_tri(c, ix[i], ix[i + 2], ix[i + 3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            gvp_tri(c, ix[i], ix[i + 1], ix[i + 3]);
+            gvp_tri(c, ix[i], ix[i + 3], ix[i + 2]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Length of the program in slots (through the FINAL instruction; 0 if there
+ * is none) and which inputs v[i] it reads. Each instruction has one
+ * input-register field, shared by whichever of its sources select "input". */
+static uint32_t gvp_scan(uint32_t *mask)
+{
+    const uint32_t (*prog)[4] = nv2a_vsh_program_slots();
+    uint32_t pc, len = 0, m = 0;
+
+    for (pc = nv2a_vsh_start_slot(); pc < NV2A_VSH_SLOTS; pc++) {
+        const uint32_t *t = prog[pc];
+        /* source A, B, C mux == 2 (input); register field in dword 1 bits 9-12 */
+        if (((t[2] >> 26) & 3u) == 2 || ((t[2] >> 11) & 3u) == 2 || ((t[3] >> 28) & 3u) == 2)
+            m |= 1u << ((t[1] >> 9) & 0xFu);
+        len++;
+        if (t[3] & 1)
+            break;
+        if (pc + 1 == NV2A_VSH_SLOTS)
+            return 0;                             /* no FINAL: nothing to run */
+    }
+    *mask = m;
+    return len;
+}
+
+static uint32_t gvp_hash(const void *p, size_t bytes)
+{
+    const uint32_t *w = (const uint32_t *)p;
+    uint32_t h = 2166136261u;
+    size_t i;
+
+    for (i = 0; i < bytes / 4; i++)
+        h = (h ^ w[i]) * 16777619u;
+    return h ? h : 1u;
+}
+
+static int backend_batch_gpu_vp(void)
+{
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aVpBatch vb;
+    GvpCtx c;
+    uint32_t len, mask = 0, k;
+
+    if (!s_gvp_attrs) {
+        s_gvp_attrs = (float *)malloc((size_t)NV_MAX_INDICES * NV_VERTEX_ATTRS * 4 * sizeof(float));
+        s_gvp_idx = (uint32_t *)malloc(GVP_MAX_IDX * sizeof(uint32_t));
+        s_gvp_slot_gen = (uint32_t *)calloc(NV_MAX_INDICES, sizeof(uint32_t));
+        s_gvp_slot = (uint32_t *)calloc(NV_MAX_INDICES, sizeof(uint32_t));
+        if (!s_gvp_attrs || !s_gvp_idx || !s_gvp_slot_gen || !s_gvp_slot) {
+            free(s_gvp_attrs); free(s_gvp_idx); free(s_gvp_slot_gen); free(s_gvp_slot);
+            s_gvp_attrs = NULL; s_gvp_idx = s_gvp_slot_gen = s_gvp_slot = NULL;
+            return 0;
+        }
+    }
+    len = gvp_scan(&mask);
+    if (!len)
+        return 0;
+    memset(&c, 0, sizeof c);
+    c.attrs = s_gvp_attrs;
+    c.idx = s_gvp_idx;
+    c.mask = mask;
+    for (k = 0; k < NV_VERTEX_ATTRS; k++)
+        c.floats += (mask >> k & 1u) ? 4u : 0u;
+    if (++s_gvp_gen == 0) {
+        memset(s_gvp_slot_gen, 0, NV_MAX_INDICES * sizeof(uint32_t));
+        s_gvp_gen = 1;
+    }
+    gvp_expand(&c);
+    if (c.overflow)
+        return 0;                                 /* the CPU route handles it */
+    if (!c.ni)
+        return 1;                                 /* nothing to draw is still handled */
+
+    backend_pipeline_sync();
+    s_comb = s_gpu.rc;
+    s_comb.fog_color = s_gpu.fog_color;
+    current_surface(&surf);
+    current_render_state(&rs);
+    memset(&vb, 0, sizeof vb);
+    vb.vertex_count = c.nv;
+    vb.attrs = c.attrs;
+    vb.index_count = c.ni;
+    vb.indices = c.idx;
+    vb.attr_mask = mask;
+    vb.program_len = len;
+    vb.program = (const uint32_t (*)[4])&nv2a_vsh_program_slots()[nv2a_vsh_start_slot()];
+    vb.program_gen = gvp_hash(vb.program, (size_t)len * 16u);
+    vb.constants = nv2a_vsh_constants();
+    vb.constants_gen = gvp_hash(vb.constants, sizeof(float) * 4u * NV2A_VSH_CONSTANTS);
+    vb.aa_sx = s_gpu.aa_sx;
+    vb.aa_sy = s_gpu.aa_sy;
+    vb.specular_on = 1;                           /* the CPU path uses oD1 as the program writes it */
+    vb.fog_enable = s_gpu.fog_enable;
+    vb.fog_mode = s_gpu.fog_mode;
+    vb.fog_p0 = s_gpu.fog_param[0];
+    vb.fog_p1 = s_gpu.fog_param[1];
+    for (k = 0; k < 4; k++) {
+        vb.tex_scale[k][0] = vb.tex_scale[k][1] = 1.0f;
+        if (s_stage_on[k] && !tex_size_from_format(s_stage_tex[k].color)) {
+            vb.tex_scale[k][0] = 1.0f / (float)s_stage_tex[k].width;
+            vb.tex_scale[k][1] = 1.0f / (float)s_stage_tex[k].height;
+        }
+        vb.stages[k] = s_stage_on[k] ? &s_stage_tex[k] : NULL;
+    }
+    vb.state = &rs;
+    vb.comb = &s_comb;
+    s_gpu.batches_program++;
+    s_gpu.verts_program += c.nv;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    s_backend->draw_vp(&surf, &vb);
+    s_gpu.tris_drawn += c.ni / 3;
+    note_drawn();
+    return 1;
+}
+
+static int gpu_vp_wanted(void)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_GPU_VP");
+        off = e && *e == '0';
+    }
+    return !off && s_backend && s_backend->draw_vp
+        && (s_backend->flags & NV2A_BACKEND_GPU_VERTEX_PROGRAMS)
+        && batch_uses_program();
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -3219,6 +3438,8 @@ static void raster_batch(void)
     int textured = 0;
 
     if (s_gpu.idx_count < 3)
+        return;
+    if (gpu_vp_wanted() && backend_batch_gpu_vp())
         return;
     if (batch_uses_program() || batch_is_ffp()) {
         raster_batch_program();

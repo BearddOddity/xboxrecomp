@@ -117,6 +117,51 @@ typedef struct {
     const Nv2aCombiner *comb;       /* the pixel pipeline's registers */
 } Nv2aBatch;
 
+/* A vertex-program batch handed over untransformed, for a back end that runs
+ * the program on the GPU (NV2A_BACKEND_GPU_VERTEX_PROGRAMS + Nv2aBackend.draw_vp).
+ * The executor only gathers the program's inputs:
+ *
+ *   attrs: vertex_count vertices, each the inputs v[i] for every bit i set in
+ *          attr_mask, as float4, packed in ascending i (so the stride is
+ *          16 * popcount(attr_mask) bytes). Component conversion (D3DCOLOR,
+ *          shorts, current values for absent arrays) is already done.
+ *   indices: index_count (a multiple of 3) triangle-list indices into attrs;
+ *          strips, fans and quads are already expanded.
+ *   program: program_len microcode slots (4 dwords each) from the start slot to
+ *          the FINAL instruction, in the format xemu's vsh.c documents.
+ *   constants: the 192 float4 constants c[0..191]. The program may write
+ *          constants; the back end applies those writes to a private copy.
+ *   *_gen: change whenever the program / the constants change, for caching
+ *          compiled shaders and constant uploads.
+ *
+ * The program leaves oPos in surface pixels with w = clip w (the XDK tail does
+ * the viewport scale and the perspective divide), so a back end scales x and y
+ * by aa_sx / aa_sy, as for pre-transformed vertices. Fog is the fixed
+ * pipeline's job, so its registers ride along; oD1 is used as the program
+ * writes it, as the executor's own path does. */
+typedef struct {
+    uint32_t        vertex_count;
+    const float    *attrs;
+    uint32_t        index_count;
+    const uint32_t *indices;
+    uint32_t        attr_mask;
+    uint32_t        program_len;
+    const uint32_t (*program)[4];
+    uint32_t        program_gen;
+    const float   (*constants)[4];
+    uint32_t        constants_gen;
+    float           aa_sx, aa_sy;
+    uint32_t        specular_on;                /* oD1 is used as written (else 0,0,0,1);
+                                                   the executor reports 1, as its CPU path uses it */
+    uint32_t        fog_enable, fog_mode;       /* SET_FOG_ENABLE / SET_FOG_MODE */
+    float           fog_p0, fog_p1;             /* SET_FOG_PARAMS */
+    float           tex_scale[4][2];            /* s,t multiplier per stage: 1/size for
+                                                   texel-addressed (linear) textures, else 1 */
+    const Nv2aRenderState *state;
+    const Nv2aTexture *stages[4];
+    const Nv2aCombiner *comb;
+} Nv2aVpBatch;
+
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
@@ -127,6 +172,9 @@ typedef struct {
     /* NV2A_BACKEND_* bits. Appended last: a back end whose initialiser stops
      * at flip leaves it 0, which asks for nothing. */
     uint32_t flags;
+    /* Only with NV2A_BACKEND_GPU_VERTEX_PROGRAMS: vertex-program batches go
+     * here instead of to draw(), untransformed. Leave NULL otherwise. */
+    void (*draw_vp)(const Nv2aSurface *s, const Nv2aVpBatch *b);
 } Nv2aBackend;
 
 /* Nv2aBackend.flags bits (0: the historical behaviour). */
@@ -137,6 +185,13 @@ typedef struct {
  * being clipped to the near plane by the executor. A vertex with w == 0 still
  * drops its triangle. The CPU rasteriser path is unchanged. */
 #define NV2A_BACKEND_CLIPS_HOMOGENEOUS 0x1u
+
+/* The back end runs vertex programs itself (draw_vp). The executor then skips
+ * its CPU interpreter for vertex-program batches and hands the raw program
+ * inputs over; Nv2aVpBatch carries the stage textures and combiner registers
+ * itself. Needs a loaded program and indices below 64 K; anything else takes
+ * the CPU route unchanged. RECOMP_GPU_VP=0 turns it off. */
+#define NV2A_BACKEND_GPU_VERTEX_PROGRAMS 0x2u
 
 /* The back end wants Nv2aBatch.ex / stages / comb. */
 #define NV2A_BACKEND_WANT_PIPELINE     0x4u

@@ -58,4 +58,12 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* Read-only views of what the title loaded, for a back end that runs the
+ * program itself (Nv2aVpBatch in nv2a_backend.h): the NV2A_VSH_SLOTS
+ * instructions, the slot the program starts at, and the NV2A_VSH_CONSTANTS
+ * constants. The pointers stay valid; the contents change as the title loads. */
+const uint32_t (*nv2a_vsh_program_slots(void))[4];
+uint32_t nv2a_vsh_start_slot(void);
+const float (*nv2a_vsh_constants(void))[4];
+
 #endif
