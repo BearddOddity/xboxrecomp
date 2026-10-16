@@ -3645,6 +3645,11 @@ static void frame_trace_flip(void)
     }
 }
 
+/* Batches and vertices by primitive type (the SET_BEGIN_END operand, 1 points .. 10 polygon),
+ * so the report can say how much of what a title draws is points or lines, which the
+ * executor does not rasterise. */
+static uint32_t s_prim_batches[11], s_prim_verts[11];
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3652,6 +3657,10 @@ static void draw_primitive(void)
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
+    if (s_gpu.prim < 11) {
+        s_prim_batches[s_gpu.prim]++;
+        s_prim_verts[s_gpu.prim] += s_gpu.idx_count;
+    }
     s_gpu.draws++;
     if ((s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
@@ -5009,6 +5018,13 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] primitives (batches/vertices): points %u/%u (not drawn), lines %u/%u (not drawn),"
+                    " line loops %u/%u (not drawn), line strips %u/%u (not drawn); triangles %u, strips %u,"
+                    " fans %u, quads %u, quad strips %u, polygons %u\n",
+            s_prim_batches[1], s_prim_verts[1], s_prim_batches[2], s_prim_verts[2],
+            s_prim_batches[3], s_prim_verts[3], s_prim_batches[4], s_prim_verts[4],
+            s_prim_batches[5], s_prim_batches[6], s_prim_batches[7], s_prim_batches[8],
+            s_prim_batches[9], s_prim_batches[10]);
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
