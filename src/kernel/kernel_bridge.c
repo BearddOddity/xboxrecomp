@@ -3312,8 +3312,30 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    {
+        /* RECOMP_VBLANK_LATCH (per title, default off): keep the raised vblank
+         * pending until the title acknowledges it. See the latch comment in
+         * xbox_memory_layout.c. */
+        static int latch = -1;
+        extern volatile LONG g_nv2a_vblank_latch;
+        extern SRWLOCK g_nv2a_intr_lock;
+
+        if (latch < 0) {
+            const char *e = getenv("RECOMP_VBLANK_LATCH");
+            latch = e && strcmp(e, "0") != 0;
+        }
+        if (latch) {
+            AcquireSRWLockExclusive(&g_nv2a_intr_lock);
+            InterlockedExchange(&g_nv2a_vblank_latch, 1);
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) =
+                0x80000000u | NV2A_PCRTC_INTR_VBLANK;
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) |= NV2A_PMC_INTR_PCRTC;
+            ReleaseSRWLockExclusive(&g_nv2a_intr_lock);
+        } else {
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+        }
+    }
 
     {
         static unsigned n;
