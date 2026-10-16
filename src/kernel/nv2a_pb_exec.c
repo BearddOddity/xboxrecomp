@@ -587,6 +587,25 @@ static int vertex_current_attrs(void)
     return on;
 }
 
+/* RECOMP_STRIP_ALT_WINDING, a per-title opt-in (off, the default, keeps the
+ * strip order as the index list gives it for every title): every odd triangle
+ * of a triangle strip is emitted with its first two vertices swapped, so all of
+ * a strip's triangles wind the same way, as the hardware's face test sees them
+ * and as the fork's executor emitted them. Left alone, a back end that culls or
+ * lights two-sided from the triangle's winding (it reads the cull registers in
+ * the render state) drops or back-lights every second triangle of every strip:
+ * missing faces, odd shapes, a road lit in alternating triangles. */
+static int strip_alt_winding(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_STRIP_ALT_WINDING");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -3228,8 +3247,12 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        for (i = 0; i + 2 < n; i++) {
+            if ((i & 1) && strip_alt_winding())
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3323,8 +3346,12 @@ static void gvp_expand(GvpCtx *c)
             gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++)
-            gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
+        for (i = 0; i + 2 < n; i++) {
+            if ((i & 1) && strip_alt_winding())
+                gvp_tri(c, ix[i + 1], ix[i], ix[i + 2]);
+            else
+                gvp_tri(c, ix[i], ix[i + 1], ix[i + 2]);
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3517,9 +3544,14 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
+        for (i = 0; i + 2 < s_gpu.idx_count; i++) {
+            if ((i & 1) && strip_alt_winding())
+                raster_indexed(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i]));
+            else
+                raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i]));
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
