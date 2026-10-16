@@ -464,4 +464,47 @@ static inline int d3d8_format_is_swizzled(uint32_t fmt)
     return 1;
 }
 
+/**
+ * Bytes per texel of an NV097 colour format that is neither block-compressed
+ * nor unknown here, or 0. Only what a mip-level offset needs: the layout of
+ * the texel is the decoder's business.
+ */
+static inline uint32_t d3d8_nv_texel_bytes(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1B: case 0x1F:
+        return 1;                           /* Y8, AY8, P8, LIN_Y8, A8, LIN_AY8, LIN_A8 */
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1A:
+    case 0x1C: case 0x1D: case 0x20: case 0x27: case 0x28: case 0x29:
+        return 2;                           /* the 16-bit colour and luminance formats */
+    case 0x06: case 0x07: case 0x12: case 0x1E:
+    case 0x3A: case 0x3B: case 0x3C: case 0x3F: case 0x40: case 0x41:
+        return 4;                           /* the 32-bit ones */
+    default:
+        return 0;
+    }
+}
+
+/**
+ * Mip level `level` of a swizzled or DXT texture whose level 0 is w x h:
+ * its byte offset from level 0 and its size. The Xbox stores the levels one
+ * after another with no padding, each at least 1x1 (a DXT level at least one
+ * 4x4 block). Returns 0 for a format whose texel size is not known here.
+ */
+static inline int d3d8_mip_level(uint32_t fmt, uint32_t w, uint32_t h, uint32_t level,
+                                 uint32_t *offset, uint32_t *lw, uint32_t *lh)
+{
+    uint32_t bb = d3d8_format_dxt_block_bytes(fmt), bpp = d3d8_nv_texel_bytes(fmt), off = 0, i;
+    if (!bb && !bpp)
+        return 0;
+    for (i = 0; i < level; i++) {
+        uint32_t cw = w >> i ? w >> i : 1, ch = h >> i ? h >> i : 1;
+        off += bb ? ((cw + 3) / 4) * ((ch + 3) / 4) * bb : cw * ch * bpp;
+    }
+    *offset = off;
+    *lw = w >> level ? w >> level : 1;
+    *lh = h >> level ? h >> level : 1;
+    return 1;
+}
+
 #endif /* D3D8_SWIZZLE_H */

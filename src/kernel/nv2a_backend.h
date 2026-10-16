@@ -129,8 +129,17 @@ typedef struct {
     uint32_t flags;
 } Nv2aBackend;
 
-/* Nv2aBackend.flags: the back end wants Nv2aBatch.ex / stages / comb. */
-#define NV2A_BACKEND_WANT_PIPELINE 0x1u
+/* Nv2aBackend.flags bits (0: the historical behaviour). */
+
+/* The back end clips triangles in homogeneous space, so a vertex-program or
+ * fixed-function triangle that reaches behind the eye is handed over whole,
+ * with the signed 1/w in Nv2aVertex.rhw (negative behind the eye), instead of
+ * being clipped to the near plane by the executor. A vertex with w == 0 still
+ * drops its triangle. The CPU rasteriser path is unchanged. */
+#define NV2A_BACKEND_CLIPS_HOMOGENEOUS 0x1u
+
+/* The back end wants Nv2aBatch.ex / stages / comb. */
+#define NV2A_BACKEND_WANT_PIPELINE     0x4u
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
