@@ -1395,6 +1395,22 @@ extern SRWLOCK g_nv2a_intr_lock;
 #define SWM_PMC_PGRAPH    0x00001000u
 #define SWM_PGRAPH_INTR   0x400100u
 
+/* Vblank latch (RECOMP_VBLANK_LATCH, a per-title opt-in; see
+ * kernel_vblank_tick in kernel_bridge.c).
+ *
+ * On hardware a raised vblank stays pending until the ISR's write-1-to-clear
+ * reaches PCRTC_INTR_0. Here the registers are RAM and the thread below zeroes
+ * them every pass, so the bit the timer raised is usually gone before XDK D3D's
+ * deferred routine reads PMC_INTR and the vblank handler is skipped. With the
+ * latch set, PCRTC_INTR_0 carries a marker in bit 31 (the tick writes
+ * 0x80000001); the title's acknowledge writes a plain 1 over it, which is how
+ * the acknowledge is seen. Until then both registers are left alone, and once
+ * it is seen the latch drops and they clear as before. Off, nothing changes. */
+volatile LONG g_nv2a_vblank_latch;
+#define VBL_PCRTC_INTR    0x600100u
+#define VBL_MARKER        0x80000000u
+#define VBL_PMC_PCRTC     (1u << 24)
+
 /* Clear the request bits "hardware" would clear on its own.
  *
  * Also called by the pushbuffer walker between commands. This thread executes
@@ -1413,10 +1429,25 @@ static void nv2a_ack_busy_bits(int flip_held)
 
     AcquireSRWLockExclusive(&g_nv2a_intr_lock);
 
+    int vbl_hold = 0;
+    if (g_nv2a_vblank_latch) {
+        if (*(volatile uint32_t *)((char *)regs + VBL_PCRTC_INTR) & VBL_MARKER)
+            vbl_hold = 1;                    /* raised, not yet acknowledged */
+        else
+            InterlockedExchange(&g_nv2a_vblank_latch, 0);   /* acknowledged */
+    }
+
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
         uint32_t mask = NV2A_ACK[i].busy_mask;
+
+        if (vbl_hold) {
+            if (NV2A_ACK[i].offset == VBL_PCRTC_INTR)
+                continue;
+            if (NV2A_ACK[i].offset == SWM_PMC_INTR)
+                mask &= ~VBL_PMC_PCRTC;
+        }
 
         /* While a software-method trap is outstanding, its pending bits must
          * survive for the handler to read. */
