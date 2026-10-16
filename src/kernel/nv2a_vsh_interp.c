@@ -194,6 +194,21 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
         memcpy(&s_const[index][comp], &word, 4);
 }
 
+const uint32_t (*nv2a_vsh_program_slots(void))[4]
+{
+    return (const uint32_t (*)[4])s_program;
+}
+
+uint32_t nv2a_vsh_start_slot(void)
+{
+    return s_start_slot;
+}
+
+const float (*nv2a_vsh_constants(void))[4]
+{
+    return (const float (*)[4])s_const;
+}
+
 /* ---- execution ----------------------------------------------------------- */
 
 typedef struct { float v[4]; } vec4;
