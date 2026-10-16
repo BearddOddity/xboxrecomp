@@ -19,13 +19,15 @@ Two rules decide what may live in shared code:
 | `RECOMP_USB` | off | USB (OHCI) gamepad model | `src/usb/ohci.c` |
 | `RECOMP_VBLANK` | off (on under `RECOMP_PB_WALK=dma`) | raise the GPU's vertical blank at about 60 Hz to the title's ISR | `src/kernel/kernel_bridge.c` |
 | `RECOMP_VBLANK_LATCH` | off | with `RECOMP_VBLANK`: keep the raised vblank pending until the title acknowledges it. The NV2A ack thread otherwise zeroes it before XDK D3D's deferred routine reads it, and the vblank handler is skipped. | `src/kernel/kernel_bridge.c`, `src/kernel/xbox_memory_layout.c` |
+| `RECOMP_PB_WALK` | off (set to `dma` to turn it on) | the DMA-engine walk of the pushbuffer. Only the walk delivers D3D's software-method interrupt (`NO_OPERATION` with a value), which is where XDK D3D queues each swap for the next vblank. Without it no swap completes: the title's vblank callback never sees `D3DVBLANK_SWAPDONE`, `PCRTC_START` is never written and nothing is scanned out. Needs the title's GPU interrupt connected, and a title that does not acknowledge the interrupt can freeze under it. | `src/kernel/nv2a_pb_scan.c`, `src/kernel/nv2a_pb_exec.c` |
 | `RECOMP_HEAP_RECLAIM` | off | kernel memory: reclaim freed guest heap | `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_EXT_VMA` | off | kernel memory: extended virtual-memory areas | `src/kernel/guest_vmem.c`, `src/kernel/xbox_memory_layout.c` |
 | `RECOMP_GUEST_LOCK` | off | kernel events: guest-side lock | `src/kernel/kernel_bridge.c` |
 | `RECOMP_TITLE_KEVENTS` | off | kernel events: title kernel events | `src/kernel/kernel_bridge.c` |
 | `RECOMP_GUI` | off | runtime overlay (F1 menu, performance panel); `RECOMP_GUI_FONT` and `RECOMP_GUI_SCALE` tune it | `src/gui/gui_overlay.c` |
 
-Set a switch to any value to turn it on (`RECOMP_PB_EXEC=1`). The list above is the one the
+Set a switch to any value to turn it on (`RECOMP_PB_EXEC=1`); `RECOMP_PB_WALK` is a mode and reads
+only `dma` (the gate sets it that way). The list above is the one the
 pipeline's variant gate knows (`OPT_INS` in the toolkit's `recomp_mcp.py`); keep both in step.
 
 ## How the variant gate uses this table
