@@ -406,6 +406,27 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+/* Mip levels a texture is sampled with. A linear texture has one level: its
+ * pitch says so. A swizzled one carries its own levels in FORMAT, and it has
+ * no pitch of its own -- a CONTROL1 pitch left by an earlier linear texture
+ * would otherwise flatten it to level 0.
+ *
+ * RECOMP_TEX_MIP_FROM_FORMAT, a per-title opt-in (off, the default, keeps the
+ * pitch rule for every texture): swizzled textures take their levels from
+ * FORMAT, as the fork's texture reader does. */
+static uint32_t tex_mip_levels(uint32_t color, uint32_t pitch, uint32_t levels)
+{
+    static int from_fmt = -1;
+
+    if (from_fmt < 0) {
+        const char *e = getenv("RECOMP_TEX_MIP_FROM_FORMAT");
+        from_fmt = e && strcmp(e, "0") != 0;
+    }
+    if (from_fmt && tex_size_from_format(color))
+        return levels;
+    return pitch ? 1 : levels;
+}
+
 static void tex_update_valid(Texture *t)
 {
     t->valid = t->offset && t->width && t->height
@@ -2056,7 +2077,7 @@ static int backend_stage_texture(int i, Nv2aTexture *o)
     o->color  = t->color;
     o->addr_u = t->addr_u;
     o->addr_v = t->addr_v;
-    o->levels = t->pitch ? 1 : t->levels;
+    o->levels = tex_mip_levels(t->color, t->pitch, t->levels);
     o->filter = t->filter;
     o->palette = t->palette;
     o->palette_len = t->palette_len;
@@ -2173,7 +2194,7 @@ static void backend_flush(int textured)
         tex.color  = s_gpu.texs[0].color;
         tex.addr_u = s_gpu.texs[0].addr_u;
         tex.addr_v = s_gpu.texs[0].addr_v;
-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+        tex.levels = tex_mip_levels(s_gpu.texs[0].color, s_gpu.texs[0].pitch, s_gpu.texs[0].levels);
         tex.filter = s_gpu.texs[0].filter;
         tex.palette = s_gpu.texs[0].palette;
         tex.palette_len = s_gpu.texs[0].palette_len;
