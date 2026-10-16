@@ -4110,6 +4110,72 @@ static void flip_hold_report(void)
     h->held_ns = 0;
 }
 
+/*
+ * FLIP_STALL: hold the pushbuffer until the display has taken a buffer.
+ * RECOMP_PB_FLIP_PACE, a per-title opt-in (off, the default, ends the stall at
+ * once as above).
+ *
+ * PGRAPH keeps a read and a write index into the title's ring of display
+ * buffers. FLIP_INCREMENT_WRITE advances write when a frame is finished; the
+ * title's vblank handler advances read (PGRAPH_INCREMENT, counted by the flag
+ * thread in xbox_memory_layout.c) when it has put one on screen. FLIP_STALL
+ * waits while they are equal -- every buffer finished and none yet shown --
+ * as the NV2A PFIFO engine does.
+ *
+ * Without the wait, the GPU ran as far ahead of the display as the CPU could
+ * submit, and XDK D3D, which queues each swap for a vblank count derived from
+ * the last one, pushed its targets hundreds of vblanks into the future: swaps
+ * stopped completing and the title's frame pacing collapsed to its one-second
+ * timeout. A T()ny build without the wait ran 2 game frames a second with
+ * 1 s gaps, and flips stopped entirely after 9 s.
+ *
+ * Only with vblank delivery on (RECOMP_VBLANK) and the title's GPU interrupt
+ * connected, since nothing else would ever advance read. Bounded: after three
+ * consecutive stalls that time out, pacing turns itself off with a message
+ * rather than holding every frame for 100 ms.
+ */
+extern volatile LONG g_nv2a_flip_read_incs;
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+
+static void flip_stall(void)
+{
+    static int on = -1, misses;
+    LARGE_INTEGER f, t0, now;
+    uint32_t mod;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_FLIP_PACE");
+        const char *vb = getenv("RECOMP_VBLANK");
+        on = e && strcmp(e, "0") != 0 && vb && strcmp(vb, "0") != 0;
+    }
+    mod = s_gpu.flip_modulo ? s_gpu.flip_modulo : 1;
+    if (!on || !xbox_GetConnectedInterrupt(3) || mod < 2) {
+        s_gpu.flip_read = s_gpu.flip_write;
+        return;
+    }
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        LONG n = InterlockedExchange(&g_nv2a_flip_read_incs, 0);
+        s_gpu.flip_read = (s_gpu.flip_read + (uint32_t)n) % mod;
+        if (s_gpu.flip_read != s_gpu.flip_write) {
+            misses = 0;
+            return;
+        }
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 100)
+            break;
+        Sleep(0);
+    }
+    if (++misses >= 3) {
+        on = 0;
+        fprintf(stderr, "  [GPU] flip stall: the display never took a buffer "
+                        "in 3 x 100 ms; flip pacing off\n");
+    }
+    s_gpu.flip_read = s_gpu.flip_write;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -4454,9 +4520,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now; when the
-         * title may go on is the flip hold's (below). */
-        s_gpu.flip_read = s_gpu.flip_write;
+         * There is no scanout here to wait for, so by default that is now;
+         * RECOMP_PB_FLIP_PACE holds it until the title's vblank handler
+         * has taken a buffer. When the title may go on is the flip hold's
+         * (below). */
+        flip_stall();
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
