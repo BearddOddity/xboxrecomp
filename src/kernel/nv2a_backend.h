@@ -20,14 +20,19 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
- * matters rather than adding callbacks.
+ * A back end that draws "texture x diffuse" sees stage 0 and the diffuse
+ * colour. One that emulates the pixel pipeline itself (all four texture stages
+ * and the register combiners) sets NV2A_BACKEND_WANT_PIPELINE in
+ * Nv2aBackend.flags and then also receives Nv2aBatch.ex / stages / comb. The
+ * executor builds that data only for such a back end, so every other path is
+ * unchanged. Extend Nv2aBatch rather than adding callbacks.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+
+#include "nv2a_combiner.h"      /* Nv2aCombiner: the pixel pipeline's registers */
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -88,11 +93,28 @@ typedef struct {
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
 } Nv2aRenderState;
 
+/* What the NV2A's pixel pipeline sees per vertex, for a back end that emulates
+ * the register combiners rather than drawing texture x colour. Parallel to
+ * Nv2aBatch.vertices. d0/d1 are clamped to 0..1 (d1 is 0,0,0,1 with specular
+ * off); fog is the fog factor before the pixel stage clamps it (1 = no fog);
+ * t[] are the texture coordinates s t r q per stage, with s and t already
+ * divided by the texture size for a linear (texel-addressed) texture, so a
+ * back end samples t.xy / t.w. */
+typedef struct {
+    float d0[4], d1[4];
+    float fog;
+    float t[4][4];
+} Nv2aVertexEx;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Only with NV2A_BACKEND_WANT_PIPELINE (NULL otherwise). Appended last. */
+    const Nv2aVertexEx *ex;         /* per vertex, parallel to vertices */
+    const Nv2aTexture  *stages[4];  /* texture per stage; NULL = none bound */
+    const Nv2aCombiner *comb;       /* the pixel pipeline's registers */
 } Nv2aBatch;
 
 typedef struct {
@@ -102,7 +124,13 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* NV2A_BACKEND_* bits. Appended last: a back end whose initialiser stops
+     * at flip leaves it 0, which asks for nothing. */
+    uint32_t flags;
 } Nv2aBackend;
+
+/* Nv2aBackend.flags: the back end wants Nv2aBatch.ex / stages / comb. */
+#define NV2A_BACKEND_WANT_PIPELINE 0x1u
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
