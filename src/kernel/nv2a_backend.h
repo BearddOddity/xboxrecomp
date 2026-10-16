@@ -51,6 +51,12 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    /* Palettised formats (P8, colour code 0x0B): guest address of the palette
+     * (A8R8G8B8 entries) and how many entries it holds; 0 for every other
+     * format. A back end that ignores them cannot draw a P8 texture, and the
+     * executor's own sampler already reads the palette. Appended last, so a
+     * back end built against the older struct is unaffected. */
+    uint32_t palette, palette_len;
 } Nv2aTexture;
 
 typedef struct {
