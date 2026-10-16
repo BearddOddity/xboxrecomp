@@ -95,6 +95,12 @@ void xbox_InputInit(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
+ * While captured, xbox_InputGetState() reports the pad connected with
+ * nothing pressed (a host overlay's menu holds the input then). Default off.
+ */
+void xbox_InputSetCaptured(BOOL captured);
+
+/**
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);

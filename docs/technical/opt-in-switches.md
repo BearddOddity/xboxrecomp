@@ -40,6 +40,20 @@ ranges). It also reports the state of each switch above for that XBE:
 The environment for a run is only the switches set `on`. A title with no `recomp_variant.json`
 runs with an empty environment, so the default path is untouched.
 
+## Back-end flags (a game project's renderer asks, not the environment)
+
+A render back end (`nv2a_backend.h`) opts in to extra work by setting bits in `Nv2aBackend.flags`.
+Unset bits cost nothing: the executor builds the extra data only for a back end that asks.
+
+| Flag | Value | What the back end receives |
+|---|---|---|
+| `NV2A_BACKEND_CLIPS_HOMOGENEOUS` | `0x1` | Triangles that reach behind the eye whole, with a signed `1/w` in `Nv2aVertex.rhw`, instead of the executor's near-plane clip. |
+| `NV2A_BACKEND_GPU_VERTEX_PROGRAMS` | `0x2` | Vertex-program batches untransformed through `draw_vp` (`Nv2aVpBatch`: microcode, constants, per-vertex program inputs). `RECOMP_GPU_VP=0` turns it off at run time. |
+| `NV2A_BACKEND_WANT_PIPELINE` | `0x4` | `Nv2aBatch.ex` (per-vertex colours, fog, four stages' texture coordinates), `stages[4]` and `comb` (the combiner registers). |
+
+Texture palettes (`Nv2aTexture.palette`, `palette_len`) are always filled: they are plain data a back
+end may ignore.
+
 ## Adding a switch
 
 1. Read it with `getenv` at one place, default off.

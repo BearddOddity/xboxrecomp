@@ -16,6 +16,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* While captured (xbox_InputSetCaptured), xbox_InputGetState() reports the pad
+ * connected with nothing pressed, so the title sees no input while a host
+ * overlay's menu holds it. Off by default: nothing sets it unless a host asks. */
+static volatile int g_input_captured;
+
+void xbox_InputSetCaptured(BOOL captured) { g_input_captured = captured ? 1 : 0; }
+
+static void input_neutral(XBOX_INPUT_STATE *s)
+{
+    DWORD packet = s->dwPacketNumber;
+    memset(s, 0, sizeof *s);
+    s->dwPacketNumber = packet;
+}
+
 /* Merge the keyboard on top of a pad on port 0 rather than only standing in
  * for a missing one.
  *
@@ -131,6 +145,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort == 0)
         mkb_merge(dwPort, pState);
 
+    if (g_input_captured)
+        input_neutral(pState);
     return ERROR_SUCCESS;
 }
 
@@ -287,6 +303,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort == 0)
         keyboard_merge(pState);
+    if (g_input_captured)
+        input_neutral(pState);
     return ERROR_SUCCESS;
 }
 
