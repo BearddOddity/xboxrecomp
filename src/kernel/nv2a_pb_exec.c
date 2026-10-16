@@ -569,6 +569,24 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
     }
 }
 
+/* RECOMP_VERTEX_CURRENT_ATTRS, a per-title opt-in (off, the default, keeps the
+ * zero fill for every title): an attribute with no array reads its current
+ * value, the one SET_VERTEX_DATA* last wrote (s_gpu.imm_attr, which starts at
+ * 0,0,0,1), as the hardware does and as the fork's executor does; and a
+ * stride-0 array is a legal constant stream that is read, not an absent one.
+ * Titles that light with a vertex program feed the diffuse colour or the
+ * normal this way, and without it that input is black. */
+static int vertex_current_attrs(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VERTEX_CURRENT_ATTRS");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -580,7 +598,12 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    if (!a->size && vertex_current_attrs()
+            && a >= s_gpu.attr && a < s_gpu.attr + NV_VERTEX_ATTRS) {
+        memcpy(out, s_gpu.imm_attr[a - s_gpu.attr], 4 * sizeof(float));
+        return 0;                    /* still "no array" to a caller that asks */
+    }
+    if (!a->size || (!a->stride && !vertex_current_attrs()))
         return 0;
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into

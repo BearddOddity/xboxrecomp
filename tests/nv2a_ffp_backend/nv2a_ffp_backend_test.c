@@ -48,6 +48,11 @@ uint32_t xbox_VblankCount(void) { return 0; }
 uint64_t xbox_HostNowNs(void) { return 0; }
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 
+/* The flip pacing (RECOMP_PB_FLIP_PACE) reads the title's connected GPU interrupt and
+ * counts the flips the vblank handler took; off by default, so neither is reached here. */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector) { (void)vector; return 0; }
+volatile long g_nv2a_flip_read_incs;
+
 static volatile uint32_t s_pgraph_400b10;
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 {
@@ -101,6 +106,27 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 static void be_flip(void) { s_be.flips++; }
 
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
+
+/* A back end that takes vertex-program batches untransformed. */
+static struct { int draws; uint32_t mask; float v3[4]; } s_vp;
+
+static void be_draw_vp(const Nv2aSurface *s, const Nv2aVpBatch *b)
+{
+    (void)s;
+    s_vp.draws++;
+    s_vp.mask = b->attr_mask;
+    if (b->vertex_count && (b->attr_mask & 8u)) {
+        /* the packed floats of vertex 0: the inputs set in the mask, in ascending order */
+        uint32_t k, at = 0;
+        for (k = 0; k < 3; k++)
+            if (b->attr_mask >> k & 1u)
+                at += 4;
+        memcpy(s_vp.v3, b->attrs + at, 4 * sizeof(float));
+    }
+}
+
+static const Nv2aBackend s_backend_vp = { be_clear, be_draw, be_flip,
+    NV2A_BACKEND_GPU_VERTEX_PROGRAMS, be_draw_vp };
 
 /* ---- driving the executor ---------------------------------------------- */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -238,6 +264,41 @@ int main(void)
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
+
+    /* A vertex program, run on a back end that takes vertex-program batches
+     * untransformed (draw_vp): an input the program reads that has no array
+     * reads its current value, the one the last SET_VERTEX_DATA4UB wrote, when
+     * RECOMP_VERTEX_CURRENT_ATTRS is set (the test runs twice: once without it
+     * as the control, once with it). Attribute 3 has no array here.
+     * The program is two instructions that only name their inputs: v0, then v3
+     * with the FINAL bit. */
+    {
+        const int on = getenv("RECOMP_VERTEX_CURRENT_ATTRS") != NULL;
+        const uint32_t prog[8] = { 0, 0, 2u << 26, 0,
+                                   0, 3u << 9, 2u << 26, 1 };
+
+        nv2a_backend_register(&s_backend_vp);
+        m(0x1E94, 2);                                 /* TRANSFORM_EXECUTION_MODE: program */
+        m(0x1E9C, 0);                                 /* PROGRAM_LOAD slot 0 */
+        for (i = 0; i < 8; i++)
+            m(0x0B00 + 4 * i, prog[i]);
+        m(0x1EA0, 0);                                 /* PROGRAM_START */
+        m(0x176C, 0);                                 /* attr 3: no array */
+        m(0x1940 + 3 * 4, 0xFF336699u);               /* attr 3 current value: R 99 G 66 B 33 A FF */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(s_vp.draws == 1);
+        CHECK(s_vp.mask == ((1u << 0) | (1u << 3)));
+        /* attrs: 3 vertices, 8 floats each (v0 then v3); v3 of vertex 0 is floats 4..7. */
+        if (on) {
+            CHECK(near_(s_vp.v3[0], 0x99 / 255.0f) && near_(s_vp.v3[1], 0x66 / 255.0f));
+            CHECK(near_(s_vp.v3[2], 0x33 / 255.0f) && near_(s_vp.v3[3], 1.0f));
+        } else {
+            CHECK(near_(s_vp.v3[0], 0.0f) && near_(s_vp.v3[1], 0.0f));
+            CHECK(near_(s_vp.v3[2], 0.0f) && near_(s_vp.v3[3], 1.0f));
+        }
+        nv2a_backend_register(&s_backend);
+        m(0x1E94, 0);
+    }
 
     /* A garbage index (the walk is 32 bits wide now) must not reach outside
      * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
