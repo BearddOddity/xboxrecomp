@@ -27,6 +27,10 @@ typedef struct {
     uint32_t final_c0, final_c1;            /* SET_SPECULAR_FOG_FACTOR */
     uint32_t control;                       /* SET_COMBINER_CONTROL */
     uint32_t stage_program;                 /* SET_SHADER_STAGE_PROGRAM */
+    /* Not read by nv2a_rc_eval; filled for a back end that emulates the combiners
+     * itself (Nv2aBatch.comb). fog_color is SET_FOG_COLOR (R in bits 0-7, G 8-15,
+     * B 16-23, A 24-31); other_stage_input is SET_SHADER_OTHER_STAGE_INPUT. */
+    uint32_t fog_color, other_stage_input;
 } Nv2aCombiner;
 
 /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).

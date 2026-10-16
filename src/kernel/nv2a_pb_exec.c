@@ -1999,14 +1999,115 @@ static int s_xf_no_tex;
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 static uint32_t   s_bcount;
 
+/* The pixel pipeline for a back end that sets NV2A_BACKEND_WANT_PIPELINE
+ * (Nv2aBatch.ex / stages / comb): per-vertex colours, fog and the four stages'
+ * texture coordinates, the four stages' textures, and the combiner registers.
+ * Nothing here is allocated or filled for any other back end. */
+static Nv2aVertexEx *s_bex;          /* parallel to s_bverts; allocated on first use */
+static Nv2aTexture   s_stage_tex[4];
+static int           s_stage_on[4];
+static Nv2aCombiner  s_comb;
+
+static float fog_factor(float d);    /* defined with the pixel loop below */
+
+static int backend_wants_pipeline(void)
+{
+    return s_backend && (s_backend->flags & NV2A_BACKEND_WANT_PIPELINE);
+}
+
 static Nv2aVertex *backend_slot(void)
 {
     if (!s_bverts
         && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
         return NULL;
+    if (backend_wants_pipeline() && !s_bex
+        && !(s_bex = (Nv2aVertexEx *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bex)))
+        return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
     return &s_bverts[s_bcount];
+}
+
+/* Texture stage i as the title programmed it. Off unless its shader stage
+ * takes a texture (not none, pass-through or clip plane; cube maps are not
+ * handed over) and the texture is usable. */
+static int backend_stage_texture(int i, Nv2aTexture *o)
+{
+    const Texture *t = &s_gpu.texs[i];
+    uint32_t mode = (s_gpu.rc.stage_program >> (i * 5)) & 0x1F;
+
+    if (!mode || mode == 4 || mode == 5 || t->cube)
+        return 0;
+    if (!t->offset || !t->width || !t->height
+        || !(tex_size_from_format(t->color) || t->pitch))
+        return 0;
+    o->offset = t->offset;
+    o->width  = t->width;
+    o->height = t->height;
+    o->pitch  = t->pitch;
+    o->color  = t->color;
+    o->addr_u = t->addr_u;
+    o->addr_v = t->addr_v;
+    o->levels = t->pitch ? 1 : t->levels;
+    o->filter = t->filter;
+    o->palette = t->palette;
+    o->palette_len = t->palette_len;
+    return 1;
+}
+
+/* Decode the four stages once, before a batch's first vertex: a vertex's
+ * texture coordinates are normalised by its stage's texture. */
+static void backend_pipeline_sync(void)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        s_stage_on[i] = backend_stage_texture(i, &s_stage_tex[i]);
+}
+
+static void backend_ex_clamp(float d[4], const float s[4])
+{
+    int k;
+    for (k = 0; k < 4; k++)
+        d[k] = s[k] != s[k] ? 1.0f : s[k] < 0.0f ? 0.0f : s[k] > 1.0f ? 1.0f : s[k];
+}
+
+/* A linear texture is addressed in texels: normalise s and t and leave q, so
+ * s/q and t/q stay the same projection. */
+static void backend_ex_normalise(Nv2aVertexEx *x)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        if (s_stage_on[i] && !tex_size_from_format(s_stage_tex[i].color)) {
+            x->t[i][0] /= (float)s_stage_tex[i].width;
+            x->t[i][1] /= (float)s_stage_tex[i].height;
+        }
+}
+
+static void backend_ex_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *x)
+{
+    backend_ex_clamp(x->d0, v->d0);
+    backend_ex_clamp(x->d1, v->d1);
+    x->fog = fog_factor(v->fog[0]);
+    memcpy(x->t, v->tex, sizeof x->t);
+    backend_ex_normalise(x);
+}
+
+/* A pre-transformed vertex: the diffuse colour it carries, no specular, fog
+ * from the eye distance (1/rhw), and the texture-coordinate attributes. */
+static void backend_ex_from_screen(uint32_t index, float rhw, uint32_t diffuse,
+                                   Nv2aVertexEx *x)
+{
+    int i;
+    x->d0[0] = ((diffuse >> 16) & 0xFF) / 255.0f;
+    x->d0[1] = ((diffuse >>  8) & 0xFF) / 255.0f;
+    x->d0[2] = ( diffuse        & 0xFF) / 255.0f;
+    x->d0[3] = ((diffuse >> 24) & 0xFF) / 255.0f;
+    x->d1[0] = x->d1[1] = x->d1[2] = 0.0f;
+    x->d1[3] = 1.0f;
+    x->fog = fog_factor(rhw != 0.0f ? fabsf(1.0f / rhw) : INFINITY);
+    for (i = 0; i < 4; i++)
+        fetch_attr(&s_gpu.attr[9 + i], index, x->t[i]);
+    backend_ex_normalise(x);
 }
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
@@ -2043,6 +2144,19 @@ static void backend_flush(int textured)
     batch.count = s_bcount;
     batch.texture = NULL;
     batch.state = &rs;
+    batch.ex = NULL;
+    batch.stages[0] = batch.stages[1] = batch.stages[2] = batch.stages[3] = NULL;
+    batch.comb = NULL;
+    if (s_bex && backend_wants_pipeline()) {
+        int i;
+        backend_pipeline_sync();
+        for (i = 0; i < 4; i++)
+            batch.stages[i] = s_stage_on[i] ? &s_stage_tex[i] : NULL;
+        s_comb = s_gpu.rc;
+        s_comb.fog_color = s_gpu.fog_color;
+        batch.comb = &s_comb;
+        batch.ex = s_bex;
+    }
     if (textured && s_gpu.texs[0].valid) {
         tex.offset = s_gpu.texs[0].offset;
         tex.width  = s_gpu.texs[0].width;
@@ -2093,6 +2207,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 
         if (!o)
             return;
+        if (s_bex && !s_bcount)
+            backend_pipeline_sync();
         for (k = 0; k < 3; k++) {
             o[k].x = p[k][0];
             o[k].y = p[k][1];
@@ -2101,6 +2217,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             o[k].diffuse = vertex_color(ix[k]);
             o[k].u = textured ? uv[k][0] : 0.0f;
             o[k].v = textured ? uv[k][1] : 0.0f;
+            if (s_bex)
+                backend_ex_from_screen(ix[k], o[k].rhw, o[k].diffuse, &s_bex[s_bcount + k]);
         }
         s_bcount += 3;
         return;
@@ -2689,6 +2807,13 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
+            if (s_bex) {
+                if (!s_bcount)
+                    backend_pipeline_sync();
+                backend_ex_from_xf(va, &s_bex[s_bcount]);
+                backend_ex_from_xf(vb, &s_bex[s_bcount + 1]);
+                backend_ex_from_xf(vc, &s_bex[s_bcount + 2]);
+            }
             s_bcount += 3;
         }
         return;
@@ -3917,6 +4042,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.rc_seen = 1;
         break;
     case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x1E78: s_gpu.rc.other_stage_input = param; break;   /* SHADER_OTHER_STAGE_INPUT */
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
 
     /* Alpha test and fog. */
