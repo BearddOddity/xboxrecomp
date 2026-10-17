@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "d3d/d3d8_swizzle.h"
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -403,6 +404,39 @@ int main(void)
         s_trap_ret = 1;
 
         CHECK(s_be.draws == draws && s_be.clears == clears);
+    }
+
+    /* Decoding a whole texture walks the image (the Morton offset stepped with
+     * the masked increment) instead of sampling each texel; the result has to be
+     * what the per-texel layout says. A swizzled 16x8 A8R8G8B8, a swizzled
+     * 32x8 L8 (not square) and a linear A8R8G8B8 with a padded pitch. */
+    {
+        uint32_t lin32[16 * 8], got[32 * 8], x, y;
+        uint8_t lin8[32 * 8];
+        Nv2aTexture tx;
+
+        for (i = 0; i < 16 * 8; i++)
+            lin32[i] = 0xFF000000u | (i * 2654435761u >> 8);
+        xbox_swizzle_rect(s_mem + 0x7000, lin32, 16, 8, 4);
+        memset(&tx, 0, sizeof tx);
+        tx.offset = 0x7000; tx.width = 16; tx.height = 8; tx.pitch = 64; tx.color = 0x06; tx.levels = 1;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        CHECK(memcmp(got, lin32, sizeof lin32) == 0);
+
+        for (i = 0; i < 32 * 8; i++)
+            lin8[i] = (uint8_t)(i * 37u + 5u);
+        xbox_swizzle_rect(s_mem + 0x7800, lin8, 32, 8, 1);
+        tx.offset = 0x7800; tx.width = 32; tx.height = 8; tx.color = 0x00;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        for (i = 0; i < 32 * 8; i++)
+            CHECK(got[i] == (0xFF000000u | lin8[i] * 0x010101u));
+
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 16; x++)
+                memcpy(s_mem + 0x8000 + y * 80 + x * 4, &lin32[y * 16 + x], 4);
+        tx.offset = 0x8000; tx.width = 16; tx.height = 8; tx.pitch = 80; tx.color = 0x12;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        CHECK(memcmp(got, lin32, sizeof lin32) == 0);
     }
 
     if (!s_fail)
