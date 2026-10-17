@@ -385,7 +385,9 @@ void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
  * skipped but which things dominate, because that is the order to implement
  * them in. */
 #define PB_EXEC_MAX_UNHANDLED 2048
-typedef struct { uint32_t method, count, last_param; } PbUnhandled;
+/* vals: the first distinct values the method carried (RECOMP_PB_UNHANDLED_ALL prints them). */
+#define PB_UNHANDLED_VALS 6
+typedef struct { uint32_t method, count, last_param, vals[PB_UNHANDLED_VALS], nvals; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
 
@@ -529,14 +531,24 @@ static void note_unhandled(uint32_t method, uint32_t param)
 
     s_gpu.unhandled_total++;
     if (*slot) {
-        s_unhandled[*slot - 1].count++;
-        s_unhandled[*slot - 1].last_param = param;
+        PbUnhandled *u = &s_unhandled[*slot - 1];
+        u->count++;
+        if (param != u->last_param && u->nvals < PB_UNHANDLED_VALS) {
+            uint32_t k;
+            for (k = 0; k < u->nvals && u->vals[k] != param; k++)
+                ;
+            if (k == u->nvals)
+                u->vals[u->nvals++] = param;
+        }
+        u->last_param = param;
         return;
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
+        s_unhandled[s_unhandled_count].vals[0] = param;
+        s_unhandled[s_unhandled_count].nvals = 1;
         s_unhandled_count++;
         *slot = (uint16_t)s_unhandled_count;
     }
@@ -895,6 +907,9 @@ static void current_render_state(Nv2aRenderState *r)
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static uint32_t linear_twin(uint32_t fmt);
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
@@ -915,6 +930,37 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
     s_gpu.texs[0].valid  = 1;
+    if (!d3d8_format_dxt_block_bytes(tex->color) && tex->width && tex->height) {
+        /* Not DXT: walk the image once instead of sampling texel by texel.
+         * The sampler recomputes the swizzle masks and deposits both
+         * coordinates for every texel, which made decoding a 256x256 swizzled
+         * texture most of a frame; here the Morton offset is stepped with
+         * the masked increment (the same offsets, see swizzle_offset). */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        const uint32_t fmt = tex->color;
+        const int swz = d3d8_format_is_swizzled(fmt);
+        const uint32_t lf = swz ? linear_twin(fmt) : fmt;
+        uint32_t mask_x = 0, mask_y = 0, off_y = 0;
+
+        if (swz)
+            xbox_swizzle_masks(tex->width, tex->height, &mask_x, &mask_y);
+        for (y = 0; y < tex->height && ok; y++) {
+            const uint8_t *row = mem + tex->offset + (swz ? 0 : (size_t)y * tex->pitch);
+            uint32_t *dst = argb_out + (size_t)y * tex->width;
+            uint32_t off_x = 0;
+
+            for (x = 0; x < tex->width; x++) {
+                if (!texel_decode(&s_gpu.texs[0], mem, lf, row, swz ? off_x + off_y : x, &dst[x])) {
+                    ok = 0;
+                    break;
+                }
+                off_x = (off_x - mask_x) & mask_x;
+            }
+            off_y = (off_y - mask_y) & mask_y;
+        }
+        s_gpu.texs[0] = saved;
+        return ok;
+    }
     for (y = 0; y < tex->height && ok; y++)
         for (x = 0; x < tex->width; x++)
             if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
@@ -1205,6 +1251,9 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb);
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -1272,7 +1321,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
+    return texel_decode(t, mem, fmt, p, u, argb);
+}
 
+/* One texel of a non-DXT format: index `u` into the row (or, swizzled, the
+ * whole image) that starts at `p`. Shared by the sampler and by the whole-
+ * texture decode below. */
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb)
+{
     switch (fmt) {
 
     /* 32-bit, alpha-red-green-blue in the dword. */
@@ -5100,9 +5157,16 @@ void nv2a_pb_exec_report(void)
              * is using. */
             union { uint32_t u; float f; } v;
             v.u = s_unhandled[i].last_param;
-            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
+            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)",
                     s_unhandled[i].method, s_unhandled[i].count,
                     v.u, v.f);
+            if (getenv("RECOMP_PB_UNHANDLED_ALL")) {
+                uint32_t k;
+                fprintf(stderr, " seen");
+                for (k = 0; k < s_unhandled[i].nvals; k++)
+                    fprintf(stderr, " %08X", s_unhandled[i].vals[k]);
+            }
+            fputc('\n', stderr);
         }
     }
     }
