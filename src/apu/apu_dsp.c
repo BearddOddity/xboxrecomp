@@ -25,6 +25,7 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -104,6 +105,46 @@ static void dsp_ack_init(void)
  * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
  * because this changes audible output for every title and an escape hatch
  * costs one branch. */
+/* OUTPUT LIMITER (opt-in).
+ *
+ * The mixdown sums every voice and clamps at full scale. A busy scene (a
+ * fight, a car crash with speech and effects on top, 50 voices at once)
+ * lands far over it and the clamp turns the excess into harsh distortion,
+ * while the quiet parts of the same title sit 30 dB lower. With a ceiling set
+ * (mcpx_apu_set_limiter, or RECOMP_AUDIO_LIMITER=<0.1..1.0>) a gain that
+ * drops at once when the louder channel would pass the ceiling, and recovers
+ * over about 100 ms, replaces the clamp for those peaks; the mix is otherwise
+ * untouched. Off (0, the default) leaves the mix exactly as it was. */
+static float s_lim_ceiling = -1.0f;                   /* -1: read the environment */
+static float s_lim_gain = 1.0f;
+
+void mcpx_apu_set_limiter(float ceiling)
+{
+    s_lim_ceiling = (ceiling >= 0.1f && ceiling <= 1.0f) ? ceiling : 0.0f;
+}
+
+static void mcpx_apu_limit(float *l, float *r)
+{
+    float peak;
+    if (s_lim_ceiling < 0.0f) {
+        const char *e = getenv("RECOMP_AUDIO_LIMITER");
+        mcpx_apu_set_limiter((e && *e) ? (float)atof(e) : 0.0f);
+    }
+    if (s_lim_ceiling == 0.0f) return;
+    *l *= s_lim_gain;
+    *r *= s_lim_gain;
+    peak = fmaxf(fabsf(*l), fabsf(*r));
+    if (peak > s_lim_ceiling) {
+        float k = s_lim_ceiling / peak;
+        *l *= k;
+        *r *= k;
+        s_lim_gain *= k;
+    } else if (s_lim_gain < 1.0f) {
+        s_lim_gain += (1.0f - s_lim_gain) * 0.0002f;
+        if (s_lim_gain > 1.0f) s_lim_gain = 1.0f;
+    }
+}
+
 static int mcpx_apu_mixdown_all(void)
 {
     static int on = -1;
@@ -289,6 +330,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
+            mcpx_apu_limit(&left, &right);
+
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
