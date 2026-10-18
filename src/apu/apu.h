@@ -31,6 +31,17 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * set, non-empty and not starting with '0'. */
 int apu_env_on(const char *name);
 
+/* Output levels (linear, 1.0 = unchanged, the default). The master level
+ * scales the whole mix; each voice belongs to one of 8 classes whose level
+ * scales it too. By default a voice is class 0 (one-shot or looping buffer) or
+ * class 1 (streamed: music and speech a title decodes on the CPU); a title
+ * may put a voice in another class, or -1 to go back to the default.
+ * RECOMP_AUDIO_VOL_MASTER and RECOMP_AUDIO_VOL_CLASS0..7 give the starting
+ * levels. */
+void mcpx_apu_set_master_gain(float gain);
+void mcpx_apu_set_class_gain(int cls, float gain);
+void mcpx_apu_set_voice_class(int voice, int cls);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
