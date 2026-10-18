@@ -42,6 +42,11 @@ void mcpx_apu_set_master_gain(float gain);
 void mcpx_apu_set_class_gain(int cls, float gain);
 void mcpx_apu_set_voice_class(int voice, int cls);
 
+/* Output limiter: a ceiling from 0.1 to 1.0 (of full scale) makes the final mix
+ * duck at once rather than hard-clip, and recover over about 100 ms; 0 turns it
+ * off, which is the default. RECOMP_AUDIO_LIMITER gives the starting ceiling. */
+void mcpx_apu_set_limiter(float ceiling);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
