@@ -51,6 +51,11 @@ static int s_scan_enabled = -1;
  * words while executing, so kickoffs are answered mid-walk. */
 extern void xbox_Nv2aAckBusyBits(void);
 static uint32_t s_ack_tick;
+/* How often the walk answers a kickoff's flush handshake: every (mask + 1)
+ * command words, a power of two minus one. 0xFF by default. A title whose
+ * kickoff waits on the handshake at every submit pays that wait in its own
+ * frame time; RECOMP_PB_ACK_MASK=15 answers sixteen times as often. */
+static uint32_t s_ack_mask = 0xFFu;
 
 /* Either switch, read once. The answer "not set" has to be cached as well as
  * "set": this runs on every pass of the NV2A poll loop, and on the default
@@ -59,7 +64,15 @@ static uint32_t s_ack_tick;
 static int pb_walk_enabled(void)
 {
     if (s_exec_enabled < 0)
+    {
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+        const char *m = getenv("RECOMP_PB_ACK_MASK");
+        if (m && *m) {
+            uint32_t v = (uint32_t)strtoul(m, NULL, 0);
+            if (v < 0x10000u && ((v + 1u) & v) == 0)
+                s_ack_mask = v;
+        }
+    }
     if (s_scan_enabled < 0)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
     return s_exec_enabled || s_scan_enabled;
@@ -448,7 +461,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         at = s_get;
 
         /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
-        if (s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
+        if (s_exec_enabled && (++s_ack_tick & s_ack_mask) == 0)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {

@@ -1649,7 +1649,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         {
                             LARGE_INTEGER wa, wb, wf;
                             QueryPerformanceCounter(&wa);
+                            extern void (*g_nv2a_event_hook)(int, uint32_t);
+                            if (g_nv2a_event_hook) g_nv2a_event_hook(1, put);
                             nv2a_pb_scan(put);
+                            if (g_nv2a_event_hook) g_nv2a_event_hook(2, put);
                             QueryPerformanceCounter(&wb);
                             QueryPerformanceFrequency(&wf);
                             g_ws_scan_us += (wb.QuadPart - wa.QuadPart) * 1000000 / wf.QuadPart;
