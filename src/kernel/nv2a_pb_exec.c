@@ -4277,6 +4277,9 @@ static void flip_hold_report(void)
  * rather than holding every frame for 100 ms.
  */
 extern volatile LONG g_nv2a_flip_read_incs;
+/* RECOMP_PB_WAITSTAT: time the walk spent held in flip_stall, and how many stalls */
+volatile LONGLONG g_nv2a_flip_wait_us;
+volatile LONG g_nv2a_flip_stalls;
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
 static void flip_stall(void)
@@ -4666,7 +4669,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * RECOMP_PB_FLIP_PACE holds it until the title's vblank handler
          * has taken a buffer. When the title may go on is the flip hold's
          * (below). */
-        flip_stall();
+        {
+            LARGE_INTEGER fa, fb, ff;
+            QueryPerformanceCounter(&fa);
+            flip_stall();
+            QueryPerformanceCounter(&fb);
+            QueryPerformanceFrequency(&ff);
+            g_nv2a_flip_wait_us += (fb.QuadPart - fa.QuadPart) * 1000000 / ff.QuadPart;
+            g_nv2a_flip_stalls++;
+        }
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();

@@ -1418,6 +1418,10 @@ volatile LONG g_nv2a_vblank_latch;
  * FLIP_STALL. The executor keeps the index; this counts the writes for it.
  * Off, the bit is left exactly as the title wrote it. */
 volatile LONG g_nv2a_flip_read_incs;
+extern volatile LONGLONG g_nv2a_flip_wait_us;      /* nv2a_pb_exec.c, RECOMP_PB_WAITSTAT */
+extern volatile LONG g_nv2a_flip_stalls;
+static LONGLONG g_ws_scan_us;                      /* walking, flip stalls included */
+static LONG g_ws_scans;
 
 static void nv2a_flip_increments(volatile uint32_t *regs)
 {
@@ -1642,7 +1646,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (get_written == 0xFFFFFFFFu || get_now != get_written)
                             nv2a_pb_resync(get_now);
                         if (put != last_put)
+                        {
+                            LARGE_INTEGER wa, wb, wf;
+                            QueryPerformanceCounter(&wa);
                             nv2a_pb_scan(put);
+                            QueryPerformanceCounter(&wb);
+                            QueryPerformanceFrequency(&wf);
+                            g_ws_scan_us += (wb.QuadPart - wa.QuadPart) * 1000000 / wf.QuadPart;
+                            g_ws_scans++;
+                        }
                     } else {
                         /* The segment scan, the default: the bytes between
                          * the previous PUT and this one. The pushbuffer is a
@@ -1750,6 +1762,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        {   /* RECOMP_PB_WAITSTAT=1: where the walk thread's second went */
+            static int ws_on = -1;
+            static ULONGLONG ws_t0;
+            if (ws_on < 0) { const char *e = getenv("RECOMP_PB_WAITSTAT"); ws_on = e && *e == '1'; }
+            if (ws_on) {
+                ULONGLONG t = GetTickCount64();
+                if (!ws_t0) ws_t0 = t;
+                if (t - ws_t0 >= 1000) {
+                    LONGLONG scan = g_ws_scan_us, flip = g_nv2a_flip_wait_us;
+                    double span = (double)(t - ws_t0);
+                    fprintf(stderr, "[WAIT] walk thread over %.0f ms: walking %.0f ms (%ld passes), of which held for the display (flip stall) %.0f ms (%ld stalls); idle and yielding %.0f ms\n",
+                            span, scan / 1000.0, (long)g_ws_scans, flip / 1000.0, (long)g_nv2a_flip_stalls,
+                            span - scan / 1000.0);
+                    g_ws_scan_us = 0; g_nv2a_flip_wait_us = 0; g_ws_scans = 0; g_nv2a_flip_stalls = 0;
+                    ws_t0 = t;
+                }
+            }
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
