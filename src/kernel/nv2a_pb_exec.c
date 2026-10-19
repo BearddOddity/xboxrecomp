@@ -623,18 +623,18 @@ static int strip_alt_winding(void)
  * caller sees a degenerate vertex rather than reading past the array. */
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t i;
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size && vertex_current_attrs()
-            && a >= s_gpu.attr && a < s_gpu.attr + NV_VERTEX_ATTRS) {
-        memcpy(out, s_gpu.imm_attr[a - s_gpu.attr], 4 * sizeof(float));
+    if (!a->size) {
+        if (vertex_current_attrs()
+                && a >= s_gpu.attr && a < s_gpu.attr + NV_VERTEX_ATTRS)
+            memcpy(out, s_gpu.imm_attr[a - s_gpu.attr], 4 * sizeof(float));
         return 0;                    /* still "no array" to a caller that asks */
     }
-    if (!a->size || (!a->stride && !vertex_current_attrs()))
+    if (!a->stride && !vertex_current_attrs())
         return 0;
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
@@ -650,7 +650,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
         if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
-        p = mem + at;
+        p = (const uint8_t *)xbox_GetMemoryOffset() + at;
     }
 
     switch (a->type) {
@@ -3347,11 +3347,23 @@ static void raster_batch_program(void)
  * nv2a_backend.h). Off with RECOMP_GPU_VP=0, and for anything it cannot
  * express (no program loaded, vertex indices past 64 K), which then takes the
  * CPU route unchanged. */
+/* One input the batch reads, resolved once per batch: a guest-memory array of
+ * floats or of D3DCOLORs is read straight (mode 1 / 2); anything else (no
+ * array, inline arrays, other formats) goes through fetch_attr (mode 0). */
+typedef struct {
+    const uint8_t *base;                 /* guest memory offset */
+    uint64_t offset;
+    uint32_t stride, size, nbytes, mode, slot;
+    const VertexAttr *attr;
+} GvpAttr;
+
 typedef struct {
     float *attrs;
     uint32_t *idx;
     uint32_t mask, floats, nv, ni;
     int overflow;
+    uint32_t nfa;
+    GvpAttr fa[NV_VERTEX_ATTRS];
 } GvpCtx;
 
 #define GVP_MAX_IDX (NV_MAX_INDICES * 3)
@@ -3368,12 +3380,55 @@ static void gvp_add(GvpCtx *c, uint32_t index)
     }
     if (s_gvp_slot_gen[index] != s_gvp_gen) {
         float *dst = c->attrs + (size_t)c->nv * c->floats;
-        uint32_t a;
-        for (a = 0; a < NV_VERTEX_ATTRS; a++)
-            if (c->mask & (1u << a)) {
-                fetch_attr(&s_gpu.attr[a], index, dst);
-                dst += 4;
+        uint32_t k;
+        for (k = 0; k < c->nfa; k++, dst += 4) {
+            const GvpAttr *f = &c->fa[k];
+            if (f->mode) {
+                uint64_t at = f->offset + (uint64_t)index * f->stride;
+                if (guest_span_ok(at, f->nbytes)) {
+                    const uint8_t *p = f->base + at;
+                    uint32_t i, n = f->size < 4 ? f->size : 4;
+                    dst[0] = dst[1] = dst[2] = 0.0f;
+                    dst[3] = 1.0f;
+                    switch (f->mode) {
+                    case 1:                                /* float */
+                        for (i = 0; i < n; i++)
+                            dst[i] = ((const float *)p)[i];
+                        break;
+                    case 2:                                /* D3DCOLOR: B,G,R,A bytes */
+                        dst[0] = (float)p[2] / 255.0f;
+                        dst[1] = (float)p[1] / 255.0f;
+                        dst[2] = (float)p[0] / 255.0f;
+                        dst[3] = (float)p[3] / 255.0f;
+                        break;
+                    case 3:                                /* signed short, normalised */
+                        for (i = 0; i < n; i++)
+                            dst[i] = (float)((const int16_t *)p)[i] / 32767.0f;
+                        break;
+                    case 4:                                /* signed short, as is */
+                        for (i = 0; i < n; i++)
+                            dst[i] = (float)((const int16_t *)p)[i];
+                        break;
+                    case 5:                                /* unsigned byte, normalised */
+                        for (i = 0; i < n; i++)
+                            dst[i] = (float)p[i] / 255.0f;
+                        break;
+                    default: {                             /* packed 11:11:10 normal */
+                        uint32_t v = *(const uint32_t *)p;
+                        dst[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+                        dst[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+                        dst[2] = (float)((int32_t)v >> 22) / 511.0f;
+                        break;
+                    }
+                    }
+                } else {
+                    dst[0] = dst[1] = dst[2] = 0.0f;
+                    dst[3] = 1.0f;
+                }
+            } else {
+                fetch_attr(f->attr, index, dst);
             }
+        }
         s_gvp_slot_gen[index] = s_gvp_gen;
         s_gvp_slot[index] = c->nv++;
     }
@@ -3458,11 +3513,22 @@ static uint32_t gvp_scan(uint32_t *mask)
 static uint32_t gvp_hash(const void *p, size_t bytes)
 {
     const uint32_t *w = (const uint32_t *)p;
-    uint32_t h = 2166136261u;
-    size_t i;
+    /* Four independent chains: one FNV chain is latency-bound on its multiply
+     * (3 KB of constants per batch); the generation only has to differ when
+     * the bytes do. */
+    uint32_t h0 = 2166136261u, h1 = 2166136261u ^ 0x9E3779B9u,
+             h2 = 2166136261u ^ 0x85EBCA6Bu, h3 = 2166136261u ^ 0xC2B2AE35u, h;
+    size_t i = 0, n = bytes / 4;
 
-    for (i = 0; i < bytes / 4; i++)
-        h = (h ^ w[i]) * 16777619u;
+    for (; i + 4 <= n; i += 4) {
+        h0 = (h0 ^ w[i])     * 16777619u;
+        h1 = (h1 ^ w[i + 1]) * 16777619u;
+        h2 = (h2 ^ w[i + 2]) * 16777619u;
+        h3 = (h3 ^ w[i + 3]) * 16777619u;
+    }
+    for (; i < n; i++)
+        h0 = (h0 ^ w[i]) * 16777619u;
+    h = (((h0 * 31u + h1) * 31u + h2) * 31u + h3);
     return h ? h : 1u;
 }
 
@@ -3492,6 +3558,25 @@ static int backend_batch_gpu_vp(void)
     c.attrs = s_gvp_attrs;
     c.idx = s_gvp_idx;
     c.mask = mask;
+    for (k = 0; k < NV_VERTEX_ATTRS; k++) {
+        const VertexAttr *at = &s_gpu.attr[k];
+        GvpAttr *f;
+        if (!(mask >> k & 1u))
+            continue;
+        f = &c.fa[c.nfa++];
+        memset(f, 0, sizeof *f);
+        f->attr = at;
+        if (!s_gpu.inline_active && at->size && at->stride && at->offset
+                && (at->type <= 2 || at->type == 4 || at->type == 5 || at->type == 6)) {
+            static const uint8_t mode_of[7] = { 2, 3, 1, 0, 5, 4, 6 };
+            f->mode = mode_of[at->type];
+            f->base = (const uint8_t *)xbox_GetMemoryOffset();
+            f->offset = at->offset;
+            f->stride = at->stride;
+            f->size = at->size;
+            f->nbytes = attr_elem_bytes(at);
+        }
+    }
     for (k = 0; k < NV_VERTEX_ATTRS; k++)
         c.floats += (mask >> k & 1u) ? 4u : 0u;
     if (++s_gvp_gen == 0) {
@@ -3791,7 +3876,10 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    static int exec_verbose = -1;     /* once: a getenv per batch walks the environment */
+    if (exec_verbose < 0)
+        exec_verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (exec_verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4280,6 +4368,10 @@ extern volatile LONG g_nv2a_flip_read_incs;
 /* RECOMP_PB_WAITSTAT: time the walk spent held in flip_stall, and how many stalls */
 volatile LONGLONG g_nv2a_flip_wait_us;
 volatile LONG g_nv2a_flip_stalls;
+/* Optional observer of the executor's frame events, for a title's own timeline
+ * (NULL, the default, costs one test): 1 walk pass starts (arg PUT), 2 walk
+ * pass ends, 3 FLIP_INCREMENT_WRITE, 4 FLIP_STALL reached, 5 FLIP_STALL done. */
+void (*g_nv2a_event_hook)(int ev, uint32_t arg);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
 static void flip_stall(void)
@@ -4648,6 +4740,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        if (g_nv2a_event_hook) g_nv2a_event_hook(3, s_gpu.flip_write);
         frame_trace_flip();
         return;
 
@@ -4672,7 +4765,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             LARGE_INTEGER fa, fb, ff;
             QueryPerformanceCounter(&fa);
+            if (g_nv2a_event_hook) g_nv2a_event_hook(4, 0);
             flip_stall();
+            if (g_nv2a_event_hook) g_nv2a_event_hook(5, 0);
             QueryPerformanceCounter(&fb);
             QueryPerformanceFrequency(&ff);
             g_nv2a_flip_wait_us += (fb.QuadPart - fa.QuadPart) * 1000000 / ff.QuadPart;
