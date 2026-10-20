@@ -231,6 +231,25 @@ void gui_end_tab_bar(void);
 
 int  gui_is_item_hovered(void);         /* the widget just submitted */
 
+/* The size the current font gives text (up to "##", as labels show it), for
+ * lining columns up with gui_same_line(). */
+GuiVec2 gui_calc_text_size(const char *text);
+
+/* ── Free drawing ──────────────────────────────────────────────── */
+
+/* Shapes and text at absolute display pixels, into the current window (after
+ * gui_begin), clipped to it: for a screen that draws its own look, such as a
+ * game's menu style. Colours: gui_color_u32(). */
+uint32_t gui_color_u32(GuiColor c);
+void gui_draw_rect_filled(float x0, float y0, float x1, float y1, uint32_t col, float rounding);
+void gui_draw_rect(float x0, float y0, float x1, float y1, uint32_t col, float rounding, float thick);
+void gui_draw_line(float x0, float y0, float x1, float y1, uint32_t col, float thick);
+void gui_draw_triangle_filled(float ax, float ay, float bx, float by, float cx, float cy, uint32_t col);
+void gui_draw_circle_filled(float cx, float cy, float r, uint32_t col);
+/* Text with its top-left at (x, y); scale 1 is the font's size.
+ * ponytail: one baked font, so large scales are soft; a second size is the upgrade. */
+void gui_draw_text(float x, float y, uint32_t col, float scale, const char *text);
+
 #ifdef __cplusplus
 }
 #endif
