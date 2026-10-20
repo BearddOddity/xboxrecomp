@@ -3032,14 +3032,23 @@ extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c */
 
 /* RECOMP_VBLANK, defaulting on under the pushbuffer's DMA walk: XDK D3D's
  * interrupt handling waits on the vertical blank there (see
- * walk_default_switch). Set to 0 it is off. */
+ * walk_default_switch). Set to 0 it is off.
+ *
+ * RECOMP_TIMER_HIRES (the tcny-port switch for a true 60 Hz vblank on a
+ * QPC schedule with 1 ms timer granularity) is kept as a spelling of
+ * RECOMP_VBLANK=paced, which does the same since v0.15.0. */
 static const char *vblank_env(void)
 {
     const char *e = getenv("RECOMP_VBLANK");
+    const char *h = getenv("RECOMP_TIMER_HIRES");
 
     if (!e)
-        return nv2a_pb_dma_walk() ? "1" : NULL;
-    return strcmp(e, "0") ? e : NULL;
+        e = nv2a_pb_dma_walk() ? "1" : NULL;
+    else if (!strcmp(e, "0"))
+        e = NULL;
+    if (e && h && strcmp(h, "0") != 0)
+        e = "paced";
+    return e;
 }
 
 static int kernel_vblank_mode(void)
