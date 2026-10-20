@@ -17,9 +17,9 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
- * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
- * x86-64 Linux has no trap yet. */
+/* Windows: a VEH hands over the CONTEXT. POSIX (arm64 and x86-64): a
+ * SIGBUS/SIGSEGV handler hands over the ucontext (apu_hook_handle_mmio_posix,
+ * at the end). */
 #if defined(_WIN32)
 #include <windows.h>
 #include "../platform/mmio_decode.h"
@@ -69,7 +69,7 @@ static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
     mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
 }
 
-static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+static bool apu_decode_and_handle(mmio_ctx_t *ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
 
@@ -96,7 +96,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    bool ok = apu_decode_and_handle((mmio_ctx_t *)ctx, mmio_offset, is_write);
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
@@ -120,12 +120,17 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32) && defined(__aarch64__)
-/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
- * (src/platform/mmio_decode_a64.h). The host's fault handler reaches it
+#if !defined(_WIN32) && (defined(__aarch64__) || defined(__x86_64__))
+/* POSIX: the same hook over sigaction + ucontext, with the A64 decoder
+ * (src/platform/mmio_decode_a64.h) on arm64 and the x86-64 one Windows uses
+ * (src/platform/mmio_decode.h) on x86-64. The host's fault handler reaches it
  * through xbox_PosixMmioFault before it reports a crash. */
 #include <signal.h>
+#if defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
+#else
+#include "../platform/mmio_decode.h"
+#endif
 
 #define APU_MMIO_BASE  0xFE800000u
 #define APU_MMIO_SIZE  0x00080000u
@@ -167,16 +172,35 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     (void)fault_addr; (void)is_write;
     if (!g_apu_state || off >= APU_MMIO_SIZE)
         return false;
+#if defined(__aarch64__)
     if (mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr))
         return true;
+#else
+    {
+        mmio_ctx_t c;
+        mmio_ctx_from_ucontext(&c, uc);
+        if (mmio_emulate(&c, off, g_apu_state, apu_mmio_rd, apu_mmio_wr)) {
+            mmio_ctx_to_ucontext(uc, &c);
+            return true;
+        }
+    }
+#endif
     g_apu_mmio_decode_fail++;
     /* stdio in a signal handler is not async-signal-safe. The process is
      * about to die of this fault anyway, and the line is what says why;
      * capped at 20, as on Windows. */
+#if defined(__aarch64__)
     if (g_apu_mmio_decode_fail <= 20)
         fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
                 (void *)(uintptr_t)A64_CTX_PC(uc),
                 *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+#else
+    if (g_apu_mmio_decode_fail <= 20) {
+        const uint8_t *ip = (const uint8_t *)(uintptr_t)MMIO_UC_GET(uc, MMIO_UC_RIP);
+        fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
+                (const void *)ip, off, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+    }
+#endif
     return false;
 }
 #endif
