@@ -28,16 +28,34 @@
 #ifndef MMIO_DECODE_H
 #define MMIO_DECODE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_WIN32)
 #include <windows.h>
+typedef CONTEXT mmio_ctx_t;
+#elif defined(__x86_64__)
+/* POSIX x86-64: the registers the decoder reads and writes, under their
+ * Win32 CONTEXT names so one decoder serves both. The fault handler fills one
+ * from its ucontext (mmio_ctx_from_ucontext) and writes it back
+ * (mmio_ctx_to_ucontext) when the access was serviced. */
+#include <signal.h>
+#include <ucontext.h>
+typedef struct {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+} mmio_ctx_t;
+#endif
+
+#if defined(_WIN32) || defined(__x86_64__)
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 
-static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+static inline uint64_t *mmio_ctx_reg(mmio_ctx_t *c, int reg)
 {
     switch (reg & 0xF) {
     case 0:  return (uint64_t *)&c->Rax;   case 1:  return (uint64_t *)&c->Rcx;
@@ -80,7 +98,7 @@ static inline uint64_t mmio_size_mask(int size)
 /* a OP b at the given width, with the flags a following jcc reads: ZF, SF, CF
  * and OF. PF and AF are left alone; nothing branches on them after a register
  * read. The logical operations clear CF and OF, as the hardware does. */
-static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
+static inline uint64_t mmio_alu(mmio_ctx_t *ctx, int op, uint64_t a, uint64_t b,
                                 int size)
 {
     uint64_t m = mmio_size_mask(size), sign = 1ULL << (size * 8 - 1), r;
@@ -112,7 +130,7 @@ static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
 
 /* A general register at an operand width. Without a REX prefix, byte
  * registers 4-7 are AH, CH, DH and BH -- bits 15:8 of registers 0-3. */
-static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
+static inline uint64_t mmio_get_reg(mmio_ctx_t *c, int reg, int size, int has_rex)
 {
     if (size == 1 && !has_rex && reg >= 4 && reg < 8)
         return (*mmio_ctx_reg(c, reg - 4) >> 8) & 0xFF;
@@ -121,7 +139,7 @@ static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
 
 /* Write with x86-64 width rules: a 32-bit write zeroes bits 63:32, an 8- or
  * 16-bit write merges into what was there. */
-static inline void mmio_set_reg(PCONTEXT c, int reg, uint64_t v, int size,
+static inline void mmio_set_reg(mmio_ctx_t *c, int reg, uint64_t v, int size,
                                 int has_rex)
 {
     uint64_t *d;
@@ -159,7 +177,7 @@ static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
  * once; a memory-destination form reads, then writes (CMP and TEST only
  * read). ADC/SBB, the rest of F6/F7 (NOT/NEG/MUL/DIV), string moves and
  * anything else return 0. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+static inline int mmio_emulate(mmio_ctx_t *ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -174,7 +192,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     for (;;) {
         uint8_t b = ip[prefix];
         if (b == 0x66)                   { has66 = 1; prefix++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix++; }
+        else if (b == 0xF0 || b == 0xF2 || b == 0xF3) { prefix++; }   /* LOCK, REP */
         else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix++; }
         else break;
     }
@@ -283,6 +301,22 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
             ctx->Rip += prefix + 2 + mlen;
             return 1;
         }
+        if (op[1] == 0xB0 || op[1] == 0xB1) {        /* CMPXCHG r/m, r       */
+            /* What InterlockedAnd/Or compile to. The caller serialises
+             * trapped accesses, which is the LOCK's atomicity here. */
+            if (op[1] == 0xB0) size = 1;
+            mlen = mmio_modrm_len(op + 2, rex_b);
+            reg  = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
+            m    = rd(dev, off, size);
+            v    = mmio_get_reg(ctx, 0, size, has_rex);  /* the accumulator */
+            mmio_alu(ctx, MMIO_ALU_CMP, v, m, size);
+            if ((v & mmio_size_mask(size)) == (m & mmio_size_mask(size)))
+                wr(dev, off, mmio_get_reg(ctx, reg, size, has_rex), size);
+            else
+                mmio_set_reg(ctx, 0, m, size, has_rex);
+            ctx->Rip += prefix + 2 + mlen;
+            return 1;
+        }
         return 0;
 
     default:
@@ -290,5 +324,47 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#if !defined(_WIN32)
+/* The ucontext's general registers, flags and rip, both ways. */
+#if defined(__APPLE__)
+#define MMIO_UC_REGS(uc, X) \
+    X(Rax, __rax) X(Rcx, __rcx) X(Rdx, __rdx) X(Rbx, __rbx) X(Rsp, __rsp) \
+    X(Rbp, __rbp) X(Rsi, __rsi) X(Rdi, __rdi) X(R8, __r8) X(R9, __r9) \
+    X(R10, __r10) X(R11, __r11) X(R12, __r12) X(R13, __r13) X(R14, __r14) \
+    X(R15, __r15) X(Rip, __rip)
+#define MMIO_UC_GET(uc, f) ((uint64_t)(uc)->uc_mcontext->__ss.f)
+#define MMIO_UC_SET(uc, f, v) ((uc)->uc_mcontext->__ss.f = (v))
+#define MMIO_UC_FLAGS __rflags
+#define MMIO_UC_RIP   __rip
+#else
+/* gregs[] indices of the x86-64 Linux ABI (<sys/ucontext.h> REG_R8 ...
+ * REG_EFL), written out because glibc names them only under _GNU_SOURCE. */
+#define MMIO_UC_REGS(uc, X) \
+    X(R8, 0) X(R9, 1) X(R10, 2) X(R11, 3) X(R12, 4) X(R13, 5) X(R14, 6) \
+    X(R15, 7) X(Rdi, 8) X(Rsi, 9) X(Rbp, 10) X(Rbx, 11) X(Rdx, 12) \
+    X(Rax, 13) X(Rcx, 14) X(Rsp, 15) X(Rip, 16)
+#define MMIO_UC_GET(uc, f) ((uint64_t)(uc)->uc_mcontext.gregs[f])
+#define MMIO_UC_SET(uc, f, v) ((uc)->uc_mcontext.gregs[f] = (greg_t)(v))
+#define MMIO_UC_FLAGS 17
+#define MMIO_UC_RIP   16
+#endif
+
+static inline void mmio_ctx_from_ucontext(mmio_ctx_t *c, const ucontext_t *uc)
+{
+#define MMIO_X(name, f) c->name = MMIO_UC_GET(uc, f);
+    MMIO_UC_REGS(uc, MMIO_X)
+#undef MMIO_X
+    c->EFlags = (uint32_t)MMIO_UC_GET(uc, MMIO_UC_FLAGS);
+}
+
+static inline void mmio_ctx_to_ucontext(ucontext_t *uc, const mmio_ctx_t *c)
+{
+#define MMIO_X(name, f) MMIO_UC_SET(uc, f, c->name);
+    MMIO_UC_REGS(uc, MMIO_X)
+#undef MMIO_X
+    MMIO_UC_SET(uc, MMIO_UC_FLAGS, c->EFlags);
+}
+#endif /* !_WIN32 */
+
+#endif /* _WIN32 || __x86_64__ */
 #endif /* MMIO_DECODE_H */

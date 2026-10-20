@@ -95,5 +95,9 @@ int main(void)
 }
 ```
 
-`xbox_PosixMmioFault` decodes the faulting instruction on arm64 hosts only;
-on x86-64 POSIX it always returns 0, and the traps are not armed there.
+`xbox_PosixMmioFault` decodes the faulting instruction on arm64 and x86-64
+hosts. On arm64 it serves the APU, the AC'97 bus-master page and the USB OHCI
+controllers; on x86-64 (Linux, and macOS under Rosetta) the APU, the AC'97
+page and PGRAPH's software-method trap, through the same decoder Windows uses
+(`platform/mmio_decode.h`). OHCI has no x86-64 POSIX trap yet. On any other
+host it returns 0 and the traps are not armed.
