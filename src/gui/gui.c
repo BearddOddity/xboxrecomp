@@ -1259,6 +1259,69 @@ static int nav_left_right(uint32_t id)
 
 int gui_is_item_hovered(void) { return G.cur && G.cur->last_hovered; }
 
+GuiVec2 gui_calc_text_size(const char *text)
+{
+    GuiVec2 z = { 0.0f, 0.0f };
+    return text ? text_size(text, label_end(text)) : z;
+}
+
+/* ── Free drawing ─────────────────────────────────────────────── */
+
+static DrawList *free_dl(void) { return G.cur && !G.cur->hidden ? &G.cur->dl : NULL; }
+
+uint32_t gui_color_u32(GuiColor c) { return col32c(c); }
+
+void gui_draw_rect_filled(float x0, float y0, float x1, float y1, uint32_t col, float rounding)
+{
+    DrawList *d = free_dl();
+    if (d) dl_rect_filled(d, x0, y0, x1, y1, col, rounding, CORNERS_ALL);
+}
+
+void gui_draw_rect(float x0, float y0, float x1, float y1, uint32_t col, float rounding, float thick)
+{
+    DrawList *d = free_dl();
+    if (d) dl_rect(d, x0, y0, x1, y1, col, rounding, thick);
+}
+
+void gui_draw_line(float x0, float y0, float x1, float y1, uint32_t col, float thick)
+{
+    DrawList *d = free_dl();
+    if (d) dl_line(d, x0, y0, x1, y1, col, thick);
+}
+
+void gui_draw_triangle_filled(float ax, float ay, float bx, float by, float cx, float cy, uint32_t col)
+{
+    DrawList *d = free_dl();
+    if (d) dl_triangle_filled(d, ax, ay, bx, by, cx, cy, col);
+}
+
+void gui_draw_circle_filled(float cx, float cy, float r, uint32_t col)
+{
+    DrawList *d = free_dl();
+    if (d) dl_circle_filled(d, cx, cy, r, col);
+}
+
+void gui_draw_text(float x, float y, uint32_t col, float scale, const char *s)
+{
+    DrawList *d = free_dl();
+    const char *end;
+    float px = x, base = y + G.ascent * scale;
+    if (!d || !s || !(col >> 24)) return;
+    if (scale > 0.999f && scale < 1.001f) { dl_text(d, x, y, col, s, NULL); return; }
+    end = s + strlen(s);
+    while (s < end) {
+        unsigned c = utf8_next(&s, end);
+        stbtt_aligned_quad q;
+        float qx = 0.0f, qy = 0.0f;
+        if (c == '\n') { px = x; base += G.font_size * scale; continue; }
+        stbtt_GetPackedQuad(G.chars, G.atlas_w, G.atlas_h, glyph_of(c), &qx, &qy, &q, 0);
+        if (c != ' ')
+            dl_quad_uv(d, px + q.x0 * scale, base + q.y0 * scale, px + q.x1 * scale, base + q.y1 * scale,
+                       q.s0, q.t0, q.s1, q.t1, col);
+        px += qx * scale;
+    }
+}
+
 /* ── Widgets ──────────────────────────────────────────────────── */
 
 static void text_ex(const char *s, const char *end, uint32_t col)
