@@ -13,3 +13,7 @@ elseif(NOT WIN32)
     target_link_libraries(nv2a-ffp-backend-test PRIVATE m pthread)
 endif()
 add_test(NAME nv2a-ffp-backend COMMAND nv2a-ffp-backend-test)
+# Triangle strips alternate their winding only with RECOMP_STRIP_ALT_WINDING; the same test
+# checks the unchanged order without it (the test above) and the swapped one with it.
+add_test(NAME nv2a-ffp-backend-strip-winding COMMAND nv2a-ffp-backend-test)
+set_tests_properties(nv2a-ffp-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")
