@@ -261,6 +261,37 @@ int main(void)
     nv2a_pb_exec_method(0, 0x0310, 7);
     CHECK(s_pgraph_400b10 == 0xABCD1234u);
 
+    /* The report counts batches and vertices by primitive type, and says which
+     * types the executor does not draw. One batch of points (1 vertex) and one of
+     * lines (2 vertices) go in here; the triangles drawn above are counted too. */
+    {
+        extern void nv2a_pb_exec_report(void);
+        char rep[16384], *line;
+        unsigned tris = 0;
+        size_t got;
+        FILE *f;
+
+        m(0x17FC, 1); m(0x1810, 0u << 24); m(0x17FC, 0);          /* POINTS, 1 vertex */
+        m(0x17FC, 2); m(0x1810, 1u << 24); m(0x17FC, 0);          /* LINES, 2 vertices */
+        if (!freopen("nv2a_ffp_report.stderr", "w", stderr)) {
+            printf("cannot redirect stderr\n");
+            return 2;
+        }
+        nv2a_pb_exec_report();
+        fflush(stderr);
+        f = fopen("nv2a_ffp_report.stderr", "rb");
+        got = f ? fread(rep, 1, sizeof rep - 1, f) : 0;
+        rep[got] = 0;
+        if (f) fclose(f);
+        line = strstr(rep, "[GPU] primitives (batches/vertices):");
+        CHECK(line != NULL);
+        if (line) {
+            CHECK(strstr(line, "points 1/1 (not drawn), lines 1/2 (not drawn), line loops 0/0 (not drawn),"
+                               " line strips 0/0 (not drawn);") != NULL);
+            CHECK(sscanf(strstr(line, "triangles ") + 10, "%u", &tris) == 1 && tris >= 1);
+        }
+    }
+
     /* A project that mirrors the fence (no back end names the semaphore): the
      * latch keeps the marker's address and wrap bits but reports the fence bits
      * (2..6) of the mirrored word, so D3D's compare of the two comes out equal. */
