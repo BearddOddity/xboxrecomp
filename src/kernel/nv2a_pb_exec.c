@@ -264,6 +264,7 @@ typedef struct {
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     uint32_t palette;                   /* guest address of the CLUT, P8 */
+    uint32_t palette_len;               /* CLUT entries, from SET_TEXTURE_PALETTE */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
@@ -844,7 +845,8 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].color  = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].palette = tex->palette;       /* 0 unless the caller passes a P8 palette */
+    s_gpu.texs[0].palette_len = tex->palette_len;
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
@@ -2051,6 +2053,8 @@ static void backend_flush(int textured)
         tex.addr_v = s_gpu.texs[0].addr_v;
         tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
         tex.filter = s_gpu.texs[0].filter;
+        tex.palette = s_gpu.texs[0].palette;
+        tex.palette_len = s_gpu.texs[0].palette_len;
         batch.texture = &tex;
     }
     s_backend->draw(&surf, &batch);
@@ -3626,6 +3630,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_PALETTE:
         /* The low six bits carry the DMA context and the entry count. */
         t->palette = dma_resolve(param & ~0x3Fu);
+        t->palette_len = 256u >> ((param >> 2) & 3);
         break;
     case NV097_SET_TEXTURE_ADDRESS:
         /* Four bits per axis: 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border

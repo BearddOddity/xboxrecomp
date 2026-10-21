@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "d3d/d3d8_swizzle.h"
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -61,6 +62,7 @@ static struct {
     uint32_t count;
     Nv2aVertex v[8];
     int textured;
+    uint32_t tex_color, tex_palette, tex_palette_len;
     uint32_t clear_flags, clear_argb;
 } s_be;
 
@@ -82,6 +84,11 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_be.rs = *b->state;
     s_be.count = b->count;
     s_be.textured = b->texture != NULL;
+    if (b->texture) {
+        s_be.tex_color = b->texture->color;
+        s_be.tex_palette = b->texture->palette;
+        s_be.tex_palette_len = b->texture->palette_len;
+    }
     for (i = 0; i < b->count && i < 8; i++)
         s_be.v[i] = b->vertices[i];
 }
@@ -268,6 +275,48 @@ int main(void)
     nv2a_pb_exec_method(5, 0x0310, 0x11111111u);
     CHECK(s_pgraph_400b10 == 0x11111111u);
     nv2a_pb_set_semaphore_target(0x5000);
+
+    /* A P8 texture (colour code 0x0B) is drawn through a palette. The executor
+     * hands the back end the palette's address and entry count, from
+     * SET_TEXTURE_PALETTE: the low bits are the DMA context (bit 0) and the
+     * length (bits 2-3: 256, 128, 64 or 32 entries). */
+    {
+        static const uint32_t UV[6] = { 0, 0, 0x3F800000u, 0, 0, 0x3F800000u };
+        const int draws = s_be.draws;
+
+        memcpy(s_mem + 0x5800, UV, sizeof UV);        /* three (u, v) pairs, written as float bits */
+        m(0x1744, 0x5800); m(0x1784, 2 | (2 << 4) | (8 << 8));   /* attr 9: float2 texcoord */
+        m(0x1B00, 0x1000);                                       /* texture 0 offset */
+        m(0x1B04, (0x0Bu << 8) | (1u << 16) | (3u << 20) | (3u << 24));   /* P8, 8x8, one level */
+        m(0x1B20, 0x2000 | (1u << 2));                           /* palette at 0x2000, 128 entries */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(s_be.draws == draws + 1);
+        CHECK(s_be.textured);
+        CHECK(s_be.tex_color == 0x0B);
+        CHECK(s_be.tex_palette == 0x2000 && s_be.tex_palette_len == 128);
+    }
+
+    /* The back end's own decode honours the palette too: a swizzled P8 image
+     * indexes the palette per texel, and without a palette it cannot be drawn. */
+    {
+        uint32_t pal[256], got[8 * 8], k;
+        uint8_t idx[8 * 8];
+        Nv2aTexture tx;
+
+        for (k = 0; k < 256; k++)
+            pal[k] = 0xFF000000u | (k * 0x010203u);
+        memcpy(s_mem + 0x2000, pal, sizeof pal);
+        for (k = 0; k < 8 * 8; k++)
+            idx[k] = (uint8_t)(k * 5u + 3u);
+        xbox_swizzle_rect(s_mem + 0x1000, idx, 8, 8, 1);
+        memset(&tx, 0, sizeof tx);
+        tx.offset = 0x1000; tx.width = 8; tx.height = 8; tx.pitch = 8; tx.color = 0x0B; tx.levels = 1;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 0);       /* no palette: not drawable */
+        tx.palette = 0x2000; tx.palette_len = 256;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        for (k = 0; k < 8 * 8; k++)
+            CHECK(got[k] == pal[idx[k]]);
+    }
 
     /* Clears and flips reach the back end. */
     m(0x1D90, 0xFF102030u);                           /* SET_COLOR_CLEAR_VALUE */
