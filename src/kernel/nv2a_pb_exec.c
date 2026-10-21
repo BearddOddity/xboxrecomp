@@ -831,6 +831,9 @@ static void current_render_state(Nv2aRenderState *r)
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static uint32_t linear_twin(uint32_t fmt);
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
@@ -851,6 +854,37 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
     s_gpu.texs[0].valid  = 1;
+    if (!d3d8_format_dxt_block_bytes(tex->color) && tex->width && tex->height) {
+        /* Not DXT: walk the image once instead of sampling texel by texel.
+         * The sampler recomputes the swizzle masks and deposits both
+         * coordinates for every texel, which made decoding a 256x256 swizzled
+         * texture most of a frame; here the Morton offset is stepped with the
+         * masked increment (the same offsets, see swizzle_offset). */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        const uint32_t fmt = tex->color;
+        const int swz = d3d8_format_is_swizzled(fmt);
+        const uint32_t lf = swz ? linear_twin(fmt) : fmt;
+        uint32_t mask_x = 0, mask_y = 0, off_y = 0;
+
+        if (swz)
+            xbox_swizzle_masks(tex->width, tex->height, &mask_x, &mask_y);
+        for (y = 0; y < tex->height && ok; y++) {
+            const uint8_t *row = mem + tex->offset + (swz ? 0 : (size_t)y * tex->pitch);
+            uint32_t *dst = argb_out + (size_t)y * tex->width;
+            uint32_t off_x = 0;
+
+            for (x = 0; x < tex->width; x++) {
+                if (!texel_decode(&s_gpu.texs[0], mem, lf, row, swz ? off_x + off_y : x, &dst[x])) {
+                    ok = 0;
+                    break;
+                }
+                off_x = (off_x - mask_x) & mask_x;
+            }
+            off_y = (off_y - mask_y) & mask_y;
+        }
+        s_gpu.texs[0] = saved;
+        return ok;
+    }
     for (y = 0; y < tex->height && ok; y++)
         for (x = 0; x < tex->width; x++)
             if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
@@ -1141,6 +1175,9 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb);
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -1208,7 +1245,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
+    return texel_decode(t, mem, fmt, p, u, argb);
+}
 
+/* One texel of a non-DXT format: index `u` into the row (or, swizzled, the
+ * whole image) that starts at `p`. Shared by the sampler and by the whole-
+ * texture decode above. */
+static int texel_decode(const Texture *t, const uint8_t *mem, uint32_t fmt,
+                        const uint8_t *p, uint32_t u, uint32_t *argb)
+{
     switch (fmt) {
 
     /* 32-bit, alpha-red-green-blue in the dword. */
