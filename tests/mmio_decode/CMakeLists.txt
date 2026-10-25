@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(mmio_decode_test C)
+if(NOT WIN32)
+    message(STATUS "tests/mmio_decode skipped: Windows only")
+    return()
+endif()
 set(CMAKE_C_STANDARD 11)
 # Header-only decoder: no runtime to build, just the include path.
 add_executable(mmio_decode_test test_main.c)
