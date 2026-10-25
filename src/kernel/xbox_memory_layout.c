@@ -2437,8 +2437,41 @@ volatile uint64_t g_icall_count = 0;
 
 static void xbox_heap_reset_base(void);
 
+/* RECOMP_PROFILE=<name>: a named set of opt-ins, applied before anything
+ * reads them. It only SETS a switch the user has not set, so an explicit
+ * RECOMP_SAGE=0 (or an empty one) wins, and with no profile nothing changes.
+ * Every switch keeps working by its own name; a profile is a shorthand.
+ *
+ *   clean-audio   RECOMP_SAGE=1: soft limiter, 16-bit rounding, 1 ms timers
+ */
+static void profile_set_unset(const char *name, const char *value)
+{
+    if (getenv(name))
+        return;
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+
+static void apply_profile(void)
+{
+    const char *p = getenv("RECOMP_PROFILE");
+
+    if (!p || !*p)
+        return;
+    if (!strcmp(p, "clean-audio")) {
+        profile_set_unset("RECOMP_SAGE", "1");
+        return;
+    }
+    fprintf(stderr, "[PROFILE] unknown RECOMP_PROFILE '%s' (known: clean-audio);"
+                    " nothing set\n", p);
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    apply_profile();
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;

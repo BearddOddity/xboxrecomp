@@ -194,7 +194,8 @@ int main(int argc, char **argv)
     int zero = !strcmp(mode, "heap-zero");
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && !zero && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && !zero && strncmp(mode, "profile-", 8)
+        && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -223,9 +224,31 @@ int main(int argc, char **argv)
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
+    /* profile-*: RECOMP_PROFILE is applied by MemoryLayoutInit, before anything
+     * reads its switches. Checked here, then the run stops. */
+    if (!strcmp(mode, "profile-clean-audio"))
+        set_env("RECOMP_PROFILE", "clean-audio");
+    if (!strcmp(mode, "profile-explicit")) {
+        set_env("RECOMP_PROFILE", "clean-audio");
+        set_env("RECOMP_SAGE", "0");
+    }
+    if (!strcmp(mode, "profile-unknown"))
+        set_env("RECOMP_PROFILE", "bogus");
     if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
+    }
+    if (!strncmp(mode, "profile-", 8)) {
+        const char *sage = getenv("RECOMP_SAGE");
+        int ok;
+        if (!strcmp(mode, "profile-clean-audio"))
+            ok = sage && !strcmp(sage, "1");
+        else if (!strcmp(mode, "profile-explicit"))
+            ok = sage && !strcmp(sage, "0");
+        else
+            ok = sage == NULL;
+        printf("%s %s\n", ok ? "PASS" : "FAIL", mode);
+        return ok ? 0 : 1;
     }
 
     scratch = xbox_HeapAlloc(0x10000, 4096);
