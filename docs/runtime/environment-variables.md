@@ -72,6 +72,9 @@ Opt-ins that change how the kernel layer behaves. Each fixes a class of titles; 
 | `RECOMP_DPC_ON_RAISE` | on with the gate | `0` stops DPCs running when IRQL is raised. | `kernel_hal.c` |
 | `RECOMP_CPUID_NO_SIMD` | off | Hides SIMD from `cpuid`. | `kernel_hal.c` |
 | `RECOMP_AC97_READY=1` | off | Reports the AC'97 codec ready and routes the APU aperture to the emulated APU. | `xbox_memory_layout.c`, `templates/new-game/src/main.c` |
+| `RECOMP_HONOR_SUSPEND=1` | off | Starts a worker created suspended, leaving the title to resume it. Needed by 50 Cent: Bulletproof's thread handshake. | `kernel_bridge.c` |
+| `RECOMP_HONOR_SUSPEND_MS=<ms>` | 3000 | With `RECOMP_HONOR_SUSPEND`: a suspended worker the title has not resumed after this long is started anyway, so a title that never resumes it cannot hang. | `kernel_bridge.c` |
+| `RECOMP_WAIT_LOG=1` | off | Logs each single-object wait that timed out or lasted 500 ms or more (thread, handle, timeout, result). Adds a stderr line; changes no wait. | `kernel_sync.c` |
 
 ## Graphics: pushbuffer executor
 
@@ -107,6 +110,9 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_FB_DUMP_FLIPS` | off | `1` dumps every flip; any other value names a file whose existence turns dumping on. | `nv2a_pb_exec.c` |
 | `RECOMP_FIND_NAN` | off | Scans for NaN matrices at every report. | `nv2a_pb_exec.c` |
 | `RECOMP_FIND_QUAD` | off | Scans once for quad vertices. | `nv2a_pb_exec.c` |
+| `RECOMP_TEX_BILINEAR=1` | off | Blends the four nearest texels for every textured pixel, instead of the nearest one. | `nv2a_pb_exec.c` |
+| `RECOMP_TEX_ANISO=8` or `16` | off | Takes up to that many bilinear samples along the longer texel gradient of each triangle. Implies bilinear. Other values leave it off. | `nv2a_pb_exec.c` |
+| `RECOMP_STRIP_ALT_WINDING=1` | off | Swaps the first two vertices of every odd triangle in a strip, so a strip winds one way, as on hardware. Needed by back ends that cull or light two-sided from winding. | `nv2a_pb_exec.c` |
 
 ## Video output
 
@@ -142,6 +148,12 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
 | `RECOMP_APU_MIXDOWN_ALL` | on | `0` limits the mixdown. | `apu_dsp.c` |
 | `RECOMP_APU_DSP_ACK` | auto | DSP doorbell acknowledgement: `auto` derives it, `0`/`off` disables, or a list of addresses. | `apu_dsp.c` |
 | `RECOMP_AUDIO_BUF_COUNT`, `RECOMP_AUDIO_BUF_SAMPLES` | built-in | Device buffer count and size. | `apu_sdl2.c`, `apu_xaudio2.c` |
+| `RECOMP_APU_DSP_ALIVE=<hex>` | on (`0xCCCCCC` at `0xFE85A018`) | The word DirectSound reads back in `DirectSoundDoWork`. Stored at start-up, so a title's "DSP recovery" is not triggered. `0` or `off` leaves it zero (the crackle cause); a hex value moves it for an XDK that keeps the word elsewhere. | `apu_core.c` |
+| `RECOMP_SAGE=1` | off | Smooth Audio Gain Engine: soft output limiter at 0.95, rounding to 16 bits, and 1 ms timer resolution while the APU runs (Windows). Prints a start-up line. See [Clean Audio](../pipeline/06-debugging.md#clean-audio-for-a-new-port-recomp_sage-smooth-audio-gain-engine). | `apu_dsp.c`, `apu_core.c` |
+| `RECOMP_AUDIO_LIMITER=<0.1..1.0>` | off (on at 0.95 under SAGE) | Output limiter ceiling as a fraction of full scale. `0` turns the limiter off even under SAGE. | `apu_dsp.c` |
+| `RECOMP_AUDIO_VOL_MASTER=<x>`, `RECOMP_AUDIO_VOL_CLASS0..7=<x>` | 1.0 | Linear output level for the whole mix, and for each voice class (0: one-shot or looping buffers, 1: streamed). A title can move a voice to another class with `mcpx_apu_set_voice_class`. | `apu_vp.c` |
+| `RECOMP_APU_MIXSTAT=<seconds>` | off | Prints `[APU-MIX]` every N seconds of output: raw peak, samples over full scale, samples limited, and frames by kind (full, trapped, silent with the sample counter off). | `apu_dsp.c` |
+| `RECOMP_AUDIO_AHEAD_PERIODS=<n>` | off (full lead) | Caps how far the frame thread renders ahead of the clock when the device queue is low, to n 256-sample periods. For fullscreen crackle where the render-ahead burst overtakes the title's stream. | `apu_core.c` |
 
 ## Input
 
