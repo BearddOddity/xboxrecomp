@@ -191,11 +191,23 @@ int main(int argc, char **argv)
     unsigned char *xbe;
     char d[160];
     int i;
+    int zero = !strcmp(mode, "heap-zero");
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && !zero && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
+    }
+    /* heap-zero: RECOMP_HEAP_RECLAIM=0 must leave reclaim off (it used to turn
+     * it on, since the check was "set at all"). Checked directly, then the
+     * same run as default. */
+    if (zero) {
+        set_env("RECOMP_HEAP_RECLAIM", "0");
+        if (xbox_HeapReclaimEnabled()) {
+            printf("FAIL: RECOMP_HEAP_RECLAIM=0 turned reclaim on\n");
+            return 1;
+        }
+        printf("PASS: RECOMP_HEAP_RECLAIM=0 leaves reclaim off\n");
     }
     if (reclaim)
         set_env("RECOMP_HEAP_RECLAIM", "1");

@@ -28,3 +28,10 @@ add_test(NAME kernel_memory_bridge_posix_reclaim
                  ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
 set_tests_properties(kernel_memory_bridge_posix_reclaim
                      PROPERTIES ENVIRONMENT RECOMP_HEAP_RECLAIM=1)
+# RECOMP_HEAP_RECLAIM=0 is off, as for every other RECOMP_* switch (it used to
+# turn reclaim on, because the test was "set at all").
+add_test(NAME kernel_memory_bridge_posix_reclaim_zero
+         COMMAND kernel_memory_bridge_posix_test
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+set_tests_properties(kernel_memory_bridge_posix_reclaim_zero
+                     PROPERTIES ENVIRONMENT RECOMP_HEAP_RECLAIM=0)

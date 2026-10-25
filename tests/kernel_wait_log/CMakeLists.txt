@@ -3,7 +3,9 @@ project(kernel_wait_log_test C)
 # Cross-platform: the wait functions are called directly, so it covers the
 # Win32 backend on Windows/Proton and the POSIX shims elsewhere.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_wait_log_test test_main.c)
 target_include_directories(kernel_wait_log_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_wait_log_test PRIVATE xboxrecomp)
