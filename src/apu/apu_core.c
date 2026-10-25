@@ -163,6 +163,94 @@ int apu_env_on(const char *name)
     return e && *e && *e != '0';
 }
 
+/* The encode DSP's "alive" word.
+ *
+ * Every XDK DirectSound compares one word of EP (encode processor) memory,
+ * 0xFE85A018, with 0xCCCCCC at the end of each DirectSoundDoWork. The DSP
+ * program keeps it there; this model runs no DSP program, so the word read
+ * back 0, DirectSound judged the DSP dead and "recovered" it on every call:
+ * SECTL XCNTMODE off, GP and EP reset, a 10 ms KeStallExecutionProcessor,
+ * XCNTMODE on. At the ~66 DoWork calls a second that title code makes, half
+ * the APU frames ran with the sample counter off and went out as silent
+ * periods (crackle), and each call stalled the calling thread. True Crime:
+ * NYC and Hulk: Ultimate Destruction both hit it and both patched the title.
+ *
+ * The word is read back as 0xCCCCCC. RECOMP_APU_DSP_ALIVE=0 (or off)
+ * restores the old read-as-zero; any other value is the EP-relative or
+ * absolute address (hex) of the word for an XDK that keeps it elsewhere. */
+#define APU_DSP_ALIVE_WORD   0x00CCCCCCu
+#define APU_DSP_ALIVE_OFFSET 0x5A018    /* 0xFE85A018 - 0xFE800000 */
+#define APU_BASE_PHYS        0xFE800000u
+
+int64_t apu_dsp_alive_offset(void)
+{
+    static int64_t off = -2;
+    if (off == -2) {
+        const char *e = getenv("RECOMP_APU_DSP_ALIVE");
+        off = APU_DSP_ALIVE_OFFSET;
+        if (e && *e) {
+            if (!strcmp(e, "0") || !strcmp(e, "off")) {
+                off = -1;
+            } else {
+                unsigned long v = strtoul(e, NULL, 16);
+                if (v >= APU_BASE_PHYS)
+                    v -= APU_BASE_PHYS;
+                off = v ? (int64_t)v : -1;
+            }
+        }
+    }
+    return off;
+}
+
+/* The value an access to the alive word reads, or 0 and *hit unset. */
+static uint64_t apu_dsp_alive_read(uint64_t addr, unsigned size, int *hit)
+{
+    int64_t a = apu_dsp_alive_offset();
+    *hit = 0;
+    if (a < 0 || addr < (uint64_t)a || addr >= (uint64_t)a + 4)
+        return 0;
+    *hit = 1;
+    {
+        uint64_t v = APU_DSP_ALIVE_WORD >> ((addr - (uint64_t)a) * 8);
+        return size >= 4 ? v : v & ((1ull << (size * 8)) - 1);
+    }
+}
+
+/* Safety net for a title whose "DSP alive" check this model does not
+ * satisfy (another address, another value): a title does not switch the
+ * sample counter off tens of times a second on purpose. Say so once, with
+ * the way out, instead of leaving it to be found as crackle. */
+#define COUNTER_OFF_STORM  20       /* switch-offs ... */
+#define COUNTER_OFF_WINDOW 2000     /* ... within this many ms */
+
+void apu_note_counter_off(int64_t now_ms)
+{
+    static int64_t window_start;
+    static int count, warned;
+
+    if (warned)
+        return;
+    if (now_ms - window_start > COUNTER_OFF_WINDOW) {
+        window_start = now_ms;
+        count = 0;
+    }
+    if (++count < COUNTER_OFF_STORM)
+        return;
+    warned = 1;
+    fprintf(stderr, "[APU] SECTL sample counter switched off %d times in %d ms:"
+                    " the title is probably \"recovering\" a DSP it thinks is"
+                    " dead on every DirectSoundDoWork, which silences periods"
+                    " (crackle). ", count, COUNTER_OFF_WINDOW);
+    if (apu_dsp_alive_offset() < 0)
+        fprintf(stderr, "The alive word is not answered"
+                        " (RECOMP_APU_DSP_ALIVE=0); unset it.");
+    else
+        fprintf(stderr, "The alive word is read as 0x%06X at EP+0x%llX;"
+                        " RECOMP_APU_DSP_ALIVE=<hex address> names another one.",
+                APU_DSP_ALIVE_WORD, (unsigned long long)apu_dsp_alive_offset());
+    fprintf(stderr, " RECOMP_APU_TRACE=1 shows the register writes.\n");
+}
+
 /* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
 static int apu_mmio_trace(void)
 {
@@ -436,6 +524,9 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            if (addr == NV_PAPU_SECTL &&
+                (sectl & NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF)
+                apu_note_counter_off(qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
             bool running =
                 ((sectl & NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF)
                 && ((fectl & NV_PAPU_FECTL_FEMETHMODE)
@@ -937,6 +1028,17 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * accept (4096 samples, 85 ms) still fit. */
 #define PACE_STALL_US 200000
 
+static int apu_ahead_periods(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("RECOMP_AUDIO_AHEAD_PERIODS");
+        n = (e && *e) ? atoi(e) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
 /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
  * the next period now, or how many microseconds to wait before asking again.
  *
@@ -1009,9 +1111,18 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
             ;                              /* host clock, as without a queue */
         else if (q >= high)
             return EP_FRAME_US;
-        else if (q <= low)
+        else if (q <= low) {
             ahead_us = (int64_t)high * EP_FRAME_US / MIXER_FRAME_SAMPLES;
-        else
+            /* RECOMP_AUDIO_AHEAD_PERIODS=<n>: render at most n EP periods
+             * ahead of the clock. The burst up to high samples moves a
+             * voice's play cursor past the title's own stream writes when
+             * display-paced presents jitter the queue to its low mark
+             * (borderless fullscreen); a smaller lead trades recovery speed
+             * for that. Unset: the full lead. */
+            int n = apu_ahead_periods();
+            if (n > 0 && ahead_us > (int64_t)n * EP_FRAME_US)
+                ahead_us = (int64_t)n * EP_FRAME_US;
+        } else
             mid_band = 1;
     } else {
         d->pace_stalled = false;
@@ -1450,6 +1561,11 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
+    } else {
+        int hit;
+        uint64_t v = apu_dsp_alive_read(addr, size, &hit);
+        if (hit)
+            return v;
     }
     return 0;
 }

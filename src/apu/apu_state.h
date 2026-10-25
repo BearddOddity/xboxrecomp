@@ -552,6 +552,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d);
 /* Frame-thread pacing at an EP-period boundary: 0 = render the next period
  * now, else microseconds to wait before asking again. See apu_core.c. */
 int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+/* EP offset of the word DirectSound reads back to judge the DSP alive (it
+ * reads as 0xCCCCCC), or -1 when RECOMP_APU_DSP_ALIVE=0 turned that off. */
+int64_t apu_dsp_alive_offset(void);
+/* One SECTL write switched the sample counter off; warns once on a storm. */
+void apu_note_counter_off(int64_t now_ms);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);

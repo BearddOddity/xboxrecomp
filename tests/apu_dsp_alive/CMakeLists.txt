@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_dsp_alive_test C)
+# The EP "DSP alive" word DirectSound reads back (0xFE85A018 == 0xCCCCCC), the
+# RECOMP_APU_DSP_ALIVE override, and the render-ahead cap in the pacer.
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(apu_dsp_alive_test test_main.c)
+target_include_directories(apu_dsp_alive_test PRIVATE ../../src ../../src/apu)
+target_link_libraries(apu_dsp_alive_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME apu_dsp_alive_default COMMAND apu_dsp_alive_test default)
+add_test(NAME apu_dsp_alive_off COMMAND apu_dsp_alive_test off)
+add_test(NAME apu_dsp_alive_addr COMMAND apu_dsp_alive_test addr)
+set_tests_properties(apu_dsp_alive_default PROPERTIES ENVIRONMENT "RECOMP_APU_DSP_ALIVE=")
+set_tests_properties(apu_dsp_alive_off PROPERTIES ENVIRONMENT "RECOMP_APU_DSP_ALIVE=0")
+set_tests_properties(apu_dsp_alive_addr PROPERTIES ENVIRONMENT "RECOMP_APU_DSP_ALIVE=FE85B020")

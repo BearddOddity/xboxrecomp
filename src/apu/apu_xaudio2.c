@@ -25,11 +25,18 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
+/* Device buffer size and count. Defaults 512 x 6 (10.7 ms each, 64 ms
  * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
+ * override them at xa2_init, clamped to the static storage below.
+ *
+ * 6, not 4: in borderless fullscreen each Present blocks until vblank, and
+ * that jitter is enough to take a 43 ms queue to its low mark, where the
+ * pacer renders ahead in a burst that overtakes the title's own stream.
+ * Measured on a title's looping mix buffer over 330 s: 4 buffers read 381
+ * and 122 places before the title wrote them, 6 buffers 5 and 0 (windowed:
+ * 5 and 0). */
 #define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
+#define XA2_NUM_BUFS_DEFAULT    6
 #define XA2_BUF_SAMPLES_MIN     128
 #define XA2_BUF_SAMPLES_MAX     4096
 #define XA2_NUM_BUFS_MIN        2
