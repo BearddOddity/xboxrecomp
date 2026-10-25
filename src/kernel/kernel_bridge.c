@@ -769,7 +769,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t obj_va, uint32_t tls_size)
+                                  uint32_t obj_va, uint32_t tls_size,
+                                  int suspended)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -779,7 +780,8 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->obj_va = obj_va;
     s->tls_size = tls_size;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s,
+                      suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -794,13 +796,15 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
-                                        uint32_t handle_va, uint32_t tls_size)
+                                        uint32_t handle_va, uint32_t tls_size,
+                                        int suspended)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
     thobj_ref(obj);
-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
+    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size,
+                             suspended);
     if (!th) {
         thobj_unref(obj);   /* the thread's own: it never ran */
     } else {
@@ -838,6 +842,14 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
+    /* RECOMP_HONOR_SUSPEND=1: a worker created with CreateSuspended starts
+     * suspended and waits for NtResumeThread. XAPI's CreateThread always
+     * creates suspended, stores the handle where the new thread can see it,
+     * then resumes; a worker that runs at once reads the title's thread-handle
+     * globals before they are written (50 Cent: Bulletproof's worker resumes
+     * handle 0 and its tick handshake never completes). Opt-in: a title that
+     * never resumes a thread it created suspended would hang. */
+    int create_suspended = STACK_ARG(7) && getenv("RECOMP_HONOR_SUSPEND") != NULL;
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
@@ -944,7 +956,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr,
-                                              tls_size);
+                                              tls_size, create_suspended);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -9241,7 +9253,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr, 0);
+                                              stack_top, xbox_handle_ptr, 0, 0);
                 }
             }
         } else {
