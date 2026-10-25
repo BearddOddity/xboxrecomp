@@ -79,6 +79,8 @@ def read_run(d: Path, rc: int, killed: bool) -> dict:
         "stalled": deadline and stalled(flips),
         "flips": flips[-1] if flips else None,
         "fps": float(FPS_RE.findall(err)[-1]) if FPS_RE.findall(err) else None,
+        # Progress: distinct paths the title opened (how far it got), where flips only say it is alive.
+        "files": len({ln.split("] ", 1)[1].split(" (disp", 1)[0] for ln in err.splitlines() if ln.startswith("  [FILE] ")}),
         "lift_gaps": sorted({a or b for a, b in GAP_RE.findall(err)}),
         "silent": None,
         "clipped": None,
@@ -120,6 +122,8 @@ def run_one(exe: Path, out: Path, name: str, env_set: dict, seconds: int, grace:
         "RECOMP_AUDIO_WAV": str(d / "audio.wav"),
         "RECOMP_AUDIO_WAV_SECS": str(seconds),
         "RECOMP_APU_MIXSTAT": "5",
+        # Logging only: the default 200-line budget fills in seconds, which hides how far a title got.
+        "RECOMP_KERNEL_LOG_BUDGET": "20000",
         "RECOMP_FB_DUMP": str(d / "fb"),
     })
     t0 = time.time()
@@ -142,7 +146,7 @@ def combine(ms: list) -> dict:
     if len(ms) == 1:
         return ms[0]
     out: dict = dict(ms[0], repeats=len(ms), exit=sorted(m["exit"] for m in ms)[len(ms) // 2])
-    for k in ("flips", "fps", "silent", "clipped"):
+    for k in ("flips", "fps", "files", "silent", "clipped"):
         v = [m[k] for m in ms if m[k] is not None]
         out[k] = statistics.median(v) if v else None
         out[k + "_range"] = [min(v), max(v)] if v else None
@@ -212,6 +216,13 @@ def classify(b: dict, s: dict, audio_expected: bool):
             help_.append(f"paced to 60 Hz: {b['fps']:.0f} -> {s['fps']:.0f} fps")
         elif paced(b["fps"]) and not paced(s["fps"]):
             harm.append(f"pacing lost: {b['fps']:.0f} -> {s['fps']:.0f} fps")
+    if b.get("files") is not None and s.get("files") is not None:
+        # Every run of s is 10% and 3+ files past the baseline's whole range: it got further (or less far).
+        rb, rs = b.get("files_range") or [b["files"]] * 2, s.get("files_range") or [s["files"]] * 2
+        if rs[0] > rb[1] * 1.1 and rs[0] - rb[1] >= 3:
+            help_.append(f"opens more files: {b['files']:.0f} -> {s['files']:.0f}")
+        elif rs[1] < rb[0] / 1.1 and rb[0] - rs[1] >= 3:
+            harm.append(f"opens fewer files: {b['files']:.0f} -> {s['files']:.0f}")
     if b["silent"] is not None and s["silent"] is not None:
         d = s["silent"] - b["silent"]
         if d <= -0.10:
@@ -246,7 +257,7 @@ def parse_base(text: str) -> dict:
 
 
 def selftest():
-    ok = {"crashed": False, "ended": False, "stalled": False, "flips": 60, "fps": None, "silent": 0.5,
+    ok = {"crashed": False, "ended": False, "stalled": False, "flips": 60, "fps": None, "files": None, "silent": 0.5,
           "clipped": 0.0, "frames": 1000, "exit": 3, "deadline": True}
     bad = dict(ok, crashed=True, exit=-1073741819, deadline=False, flips=None, silent=None, frames=0)
     stall = dict(ok, stalled=True, flips=0)
@@ -272,6 +283,9 @@ def selftest():
     assert combine([r(1, stalled=True), r(1, stalled=True), r(1)])["stalled"] is True
     assert combine([r(1, stalled=True), r(1), r(1)])["stalled"] is False
     assert paced(59.0) and not paced(89.0)
+    assert classify(dict(ok, files=178), dict(ok, files=240), True)[0] == "helpful"  # got further
+    assert classify(dict(ok, files=178), dict(ok, files=180), True)[0] == "no_effect"
+    assert classify(dict(ok, files=240), dict(ok, files=178), True)[0] == "harmful"
     pc = pair_configs({"A": "stalled"}, [("A", "1"), ("B", "2"), ("C", "3")], {"BASE": "1"})
     assert [n for n, _ in pc] == ["A+B", "A+C"] and pc[0][1] == {"BASE": "1", "A": "1", "B": "2"}
     assert pair_configs({"A": "x", "B": "y"}, [("A", "1"), ("B", "2"), ("C", "3")], {}) == [
