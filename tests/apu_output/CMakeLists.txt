@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_output_test C)
+# The last stage between the mix and the device: the old clamp by default,
+# the soft limiter under RECOMP_SAGE / RECOMP_AUDIO_LIMITER.
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(apu_output_test test_main.c)
+target_include_directories(apu_output_test PRIVATE ../../src ../../src/apu)
+target_link_libraries(apu_output_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME apu_output_default COMMAND apu_output_test default)
+add_test(NAME apu_output_sage COMMAND apu_output_test sage)
+add_test(NAME apu_output_ceiling COMMAND apu_output_test ceiling)
+add_test(NAME apu_output_limiter_off COMMAND apu_output_test limiter_off)
+set_tests_properties(apu_output_default PROPERTIES ENVIRONMENT "RECOMP_SAGE=;RECOMP_AUDIO_LIMITER=")
+set_tests_properties(apu_output_sage PROPERTIES ENVIRONMENT "RECOMP_SAGE=1;RECOMP_AUDIO_LIMITER=")
+set_tests_properties(apu_output_ceiling PROPERTIES ENVIRONMENT "RECOMP_SAGE=;RECOMP_AUDIO_LIMITER=0.5")
+set_tests_properties(apu_output_limiter_off PROPERTIES ENVIRONMENT "RECOMP_SAGE=1;RECOMP_AUDIO_LIMITER=0")

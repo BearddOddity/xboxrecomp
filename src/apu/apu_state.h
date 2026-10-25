@@ -555,6 +555,11 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
 /* EP offset of the word DirectSound reads back to judge the DSP alive (it
  * reads as 0xCCCCCC), or -1 when RECOMP_APU_DSP_ALIVE=0 turned that off. */
 int64_t apu_dsp_alive_offset(void);
+/* The last stage, mix to device (see SAGE in apu_dsp.c): the limiter
+ * ceiling now in force (0: off, the old clamp and truncation) and one stereo
+ * sample through the stage. */
+float mcpx_apu_output_ceiling(void);
+void mcpx_apu_output_stage(float l, float r, int16_t *out_l, int16_t *out_r);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);

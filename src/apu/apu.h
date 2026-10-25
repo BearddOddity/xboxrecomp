@@ -33,6 +33,27 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * RECOMP_APU_DSP_ALIVE in docs/pipeline/06-debugging.md. Returns 1 if stored. */
 int mcpx_apu_seed_dsp_memory(void *aperture, size_t size);
 
+/* SAGE (Smooth Audio Gain Engine): an opt-in for a newly recompiled title.
+ *
+ * RECOMP_SAGE=1 puts the final mix through a soft output limiter
+ * (ceiling 0.95 of full scale) instead of the hard clamp that turns a loud
+ * scene into harsh distortion, and rounds to 16 bits rather than truncating.
+ * Off, the mix is unchanged to the bit. RECOMP_AUDIO_LIMITER=<0.1..1.0> sets
+ * the ceiling on its own (0 turns the limiter off, even under SAGE).
+ * RECOMP_APU_MIXSTAT=<seconds> prints "[APU-MIX]" lines with the loudest
+ * peak and how many samples would have clipped, to see whether it is needed.
+ *
+ * Output levels (linear, 1.0 = unchanged, the default). The master level
+ * scales the whole mix; each voice belongs to one of 8 classes whose level
+ * scales it too: class 0 for a one-shot or looping buffer, class 1 for a
+ * streamed voice (music and speech decoded on the CPU) unless the title says
+ * otherwise. RECOMP_AUDIO_VOL_MASTER and RECOMP_AUDIO_VOL_CLASS0..7 give the
+ * starting levels. */
+void mcpx_apu_set_master_gain(float gain);
+void mcpx_apu_set_class_gain(int cls, float gain);
+void mcpx_apu_set_voice_class(int voice, int cls);   /* cls -1: back to default */
+void mcpx_apu_set_limiter(float ceiling);            /* 0.1..1.0, or 0 for off */
+
 /* A diagnostic switch (RECOMP_APU_TRACE, RECOMP_APU_RING, ...) is on when
  * set, non-empty and not starting with '0'. */
 int apu_env_on(const char *name);

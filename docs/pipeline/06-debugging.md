@@ -372,6 +372,40 @@ kernel call summary), with frames never leaving the first screen.
   resumed` line. A worker the title resumed and later parked itself is left
   alone.
 
+## Clean Audio For A New Port: RECOMP_SAGE (Smooth Audio Gain Engine)
+
+Dropouts and crackle have causes in the runtime (next section) and a
+different one in the mix itself: a busy scene sums every voice and lands far
+above full scale, and the hard clamp the output used to apply turns the excess
+into harsh distortion while the quiet parts of the same title sit 30 dB lower.
+Hulk: Ultimate Destruction peaked at +9 dBFS and clamped up to 2% of its
+samples; True Crime: NYC needed the same fix. Both carried it as a downstream
+patch. It is now in the SDK, off by default, so a newly recompiled title can
+turn on one switch.
+
+1. Measure first. `RECOMP_APU_MIXSTAT=10` prints, every 10 seconds of output,
+   `[APU-MIX] <samples>: raw peak <x> (<dBFS>), over full scale <n>, limited <n>`.
+   A title whose raw peak stays under 1.0 has nothing to fix.
+2. Turn it on. `RECOMP_SAGE=1` replaces the clamp with a soft limiter
+   (ceiling 0.95 of full scale): the gain falls over about 12 samples when a
+   peak would pass the ceiling, so there is no click, and recovers over about
+   100 ms; what is left above the ceiling goes through a tanh knee that cannot
+   pass it. Output is also rounded to 16 bits rather than truncated. A mix
+   that never reaches the ceiling is untouched.
+3. Tune it. `RECOMP_AUDIO_LIMITER=<0.1..1.0>` sets the ceiling alone, and `0`
+   turns the limiter off even under SAGE. Closer to the intended balance:
+   `RECOMP_AUDIO_VOL_MASTER` and `RECOMP_AUDIO_VOL_CLASS0..7` (linear, 1.0 =
+   unchanged) scale the whole mix and each class of voice. A voice is class 0
+   (one-shot or looping buffer) or class 1 (streamed: music and speech the
+   title decodes on the CPU) unless the port says otherwise with
+   `mcpx_apu_set_voice_class(voice, class)`; `mcpx_apu_set_master_gain`,
+   `mcpx_apu_set_class_gain` and `mcpx_apu_set_limiter` (`apu.h`) do the same
+   from code, for a front-end volume slider.
+
+With none of these set the output is the old clamp and truncation, bit for
+bit. The XAudio2 queue depth (6 x 512 by default on Windows) and the DSP
+alive word (next section) are always on and are not part of this switch.
+
 ## Audio Behaviour Switches
 
 Crackle that is not the host's fault has so far come from three places.

@@ -23,8 +23,10 @@
  */
 
 #include "apu_state.h"
+#include "apu.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,6 +114,116 @@ static int mcpx_apu_mixdown_all(void)
         on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
+}
+
+/* SAGE, the Smooth Audio Gain Engine (opt-in): the last stage between the mix and the device.
+ *
+ * The mixdown sums every voice and the stage used to clamp at full scale. A
+ * busy scene (a fight, a crash with speech and effects on top, fifty voices
+ * at once) lands far over it, and the clamp turns the excess into harsh
+ * distortion while the quiet parts of the same title sit 30 dB lower.
+ *
+ * RECOMP_SAGE=1, or a ceiling given with RECOMP_AUDIO_LIMITER=<0.1..1>
+ * (or mcpx_apu_set_limiter), replaces the clamp for those peaks. A gain falls
+ * toward what a sample needs over about 12 samples (a step would click) and
+ * recovers over about 100 ms; what is still above the ceiling meanwhile goes
+ * through a tanh knee, which cannot pass the ceiling, rather than the clamp.
+ * The result is rounded to 16 bits rather than truncated. SAGE alone uses a
+ * ceiling of 0.95. RECOMP_AUDIO_LIMITER=0 turns the limiter off, even under
+ * SAGE. With neither set the stage is the old clamp and truncation, bit for
+ * bit.
+ *
+ * RECOMP_APU_MIXSTAT=<seconds> prints "[APU-MIX] ..." every that many
+ * seconds of output: the loudest raw peak, the samples that would have
+ * clipped, and the samples the limiter acted on. It reads the mix before the
+ * limiter, so it says whether a title needs it. */
+#define APU_SAGE_CEILING 0.95f
+static float s_lim_ceiling = -1.0f;          /* -1: read the environment first */
+static float s_lim_gain = 1.0f;
+static unsigned long long s_st_samples, s_st_over, s_st_limited;
+static float s_st_peak;
+static int s_st_secs = -1;
+
+void mcpx_apu_set_limiter(float ceiling)
+{
+    s_lim_ceiling = (ceiling >= 0.1f && ceiling <= 1.0f) ? ceiling : 0.0f;
+}
+
+static void mcpx_apu_output_init(void)
+{
+    const char *lim = getenv("RECOMP_AUDIO_LIMITER");
+    const char *st  = getenv("RECOMP_APU_MIXSTAT");
+
+    if (lim && *lim)
+        mcpx_apu_set_limiter((float)atof(lim));
+    else
+        mcpx_apu_set_limiter(apu_env_on("RECOMP_SAGE") ? APU_SAGE_CEILING : 0.0f);
+    s_st_secs = (st && *st) ? atoi(st) : 0;
+    if (s_lim_ceiling > 0.0f)
+        fprintf(stderr, "[APU] SAGE (Smooth Audio Gain Engine): output limiter,"
+                        " ceiling %.2f, rounded to 16 bits\n", s_lim_ceiling);
+}
+
+float mcpx_apu_output_ceiling(void)
+{
+    if (s_lim_ceiling < 0.0f) mcpx_apu_output_init();
+    return s_lim_ceiling;
+}
+
+/* One stereo sample, mix to device: l and r are the summed bins. */
+void mcpx_apu_output_stage(float l, float r, int16_t *out_l, int16_t *out_r)
+{
+    float ceiling = mcpx_apu_output_ceiling();
+
+    if (s_st_secs > 0) {
+        float raw = fmaxf(fabsf(l), fabsf(r));
+        if (raw > s_st_peak) s_st_peak = raw;
+        if (raw > 1.0f) s_st_over++;
+        if (++s_st_samples >= 48000ull * (unsigned)s_st_secs) {
+            fprintf(stderr, "[APU-MIX] %llu samples: raw peak %.2f (%+.1f dBFS),"
+                            " over full scale %llu, limited %llu\n",
+                    s_st_samples, s_st_peak,
+                    s_st_peak > 0.0f ? 20.0f * log10f(s_st_peak) : -120.0f,
+                    s_st_over, s_st_limited);
+            s_st_samples = s_st_over = s_st_limited = 0;
+            s_st_peak = 0.0f;
+        }
+    }
+
+    if (ceiling > 0.0f) {
+        float raw = fmaxf(fabsf(l), fabsf(r));
+        float need = raw > ceiling ? ceiling / raw : 1.0f;
+        float knee = 0.75f * ceiling, span = ceiling - knee;
+        float *ch[2];
+        int i;
+
+        if (need < s_lim_gain) {
+            s_lim_gain += (need - s_lim_gain) * 0.08f;
+            s_st_limited++;
+        } else if (s_lim_gain < 1.0f) {
+            s_lim_gain += (1.0f - s_lim_gain) * 0.0002f;
+            if (s_lim_gain > 1.0f) s_lim_gain = 1.0f;
+        }
+        ch[0] = &l; ch[1] = &r;
+        for (i = 0; i < 2; i++) {
+            float x = *ch[i] * s_lim_gain, ax = fabsf(x);
+            if (ax > knee)
+                x = copysignf(knee + span * tanhf((ax - knee) / span), x);
+            *ch[i] = x;
+        }
+    }
+
+    if (l > 1.0f) l = 1.0f;
+    if (l < -1.0f) l = -1.0f;
+    if (r > 1.0f) r = 1.0f;
+    if (r < -1.0f) r = -1.0f;
+    if (ceiling > 0.0f) {
+        *out_l = (int16_t)lrintf(l * 32767.0f);
+        *out_r = (int16_t)lrintf(r * 32767.0f);
+    } else {
+        *out_l = (int16_t)(l * 32767.0f);
+        *out_r = (int16_t)(r * 32767.0f);
+    }
 }
 
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
@@ -289,16 +401,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
-            if (left > 1.0f) left = 1.0f;
-            if (left < -1.0f) left = -1.0f;
-            if (right > 1.0f) right = 1.0f;
-            if (right < -1.0f) right = -1.0f;
-
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
-            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
-            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+            /* Limit or clamp to [-1, 1], convert to 16-bit and write (not
+             * accumulate) into the frame buffer. Each of the 8 sub-frames
+             * writes its own 32-sample slice. */
+            mcpx_apu_output_stage(left, right,
+                                  &d->monitor.frame_buf[off + i][0],
+                                  &d->monitor.frame_buf[off + i][1]);
         }
     }
 

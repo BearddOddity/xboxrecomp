@@ -1406,6 +1406,72 @@ done:
 }
 
 /* ============================================================
+ * Output gain classes
+ *
+ * A level for the whole mix and a level for each class of voice, so a front
+ * end can offer a volume slider per class, or a port can pull a loud class
+ * toward the balance the title was mixed for. A voice's class is, by default,
+ * 0 for a one-shot or looping buffer and 1 for a streamed voice (the
+ * data-type bit of CFG_FMT: music and speech a title decodes on the CPU into
+ * a ring); a title that knows better says so per voice with
+ * mcpx_apu_set_voice_class(). Every gain starts at 1.0, so with nothing set
+ * the mix is exactly what it was. The environment sets the starting values:
+ * RECOMP_AUDIO_VOL_MASTER and RECOMP_AUDIO_VOL_CLASS<n> (0..7), a linear
+ * factor from 0 up.
+ * ============================================================ */
+#define APU_GAIN_CLASSES 8
+static float s_gain_master = 1.0f;
+static float s_gain_cls[APU_GAIN_CLASSES] = {1, 1, 1, 1, 1, 1, 1, 1};
+static signed char s_voice_cls[MCPX_HW_MAX_VOICES];   /* -1 (set at init): by data type */
+static int s_gain_init;
+
+static void apu_gain_init(void)
+{
+    const char *e;
+    char name[40];
+    int i;
+
+    for (i = 0; i < MCPX_HW_MAX_VOICES; i++) s_voice_cls[i] = -1;
+    e = getenv("RECOMP_AUDIO_VOL_MASTER");
+    if (e && *e && atof(e) >= 0.0) s_gain_master = (float)atof(e);
+    for (i = 0; i < APU_GAIN_CLASSES; i++) {
+        snprintf(name, sizeof name, "RECOMP_AUDIO_VOL_CLASS%d", i);
+        e = getenv(name);
+        if (e && *e && atof(e) >= 0.0) s_gain_cls[i] = (float)atof(e);
+    }
+    s_gain_init = 1;
+}
+
+void mcpx_apu_set_master_gain(float g)
+{
+    if (!s_gain_init) apu_gain_init();
+    s_gain_master = g < 0.0f ? 0.0f : g;
+}
+
+void mcpx_apu_set_class_gain(int cls, float g)
+{
+    if (!s_gain_init) apu_gain_init();
+    if (cls >= 0 && cls < APU_GAIN_CLASSES) s_gain_cls[cls] = g < 0.0f ? 0.0f : g;
+}
+
+void mcpx_apu_set_voice_class(int voice, int cls)
+{
+    if (!s_gain_init) apu_gain_init();
+    if (voice >= 0 && voice < MCPX_HW_MAX_VOICES)
+        s_voice_cls[voice] = (signed char)((cls >= 0 && cls < APU_GAIN_CLASSES) ? cls : -1);
+}
+
+static float apu_voice_gain(int v, bool stream)
+{
+    int c;
+
+    if (!s_gain_init) apu_gain_init();
+    c = s_voice_cls[v];
+    if (c < 0) c = stream ? 1 : 0;
+    return s_gain_master * s_gain_cls[c];
+}
+
+/* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
 
@@ -1586,6 +1652,8 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    float vgain = apu_voice_gain(v, voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0);
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1594,7 +1662,7 @@ static void voice_process(MCPXAPUState *d,
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
-        g *= attenuate(vol[b]) / hr;
+        g *= attenuate(vol[b]) / hr * vgain;
         /* The volumes are target registers: the hardware moves the level
          * toward them rather than jumping. Stepping to each frame's level
          * every 32 samples turned a voice whose volume the title changes
