@@ -153,18 +153,26 @@ def combine(ms: list) -> dict:
     return out
 
 
-def run_all(exe: Path, out: Path, configs: list, a) -> dict:
-    """Run every (name, env) config a.repeat times and combine each. Rounds are interleaved
+def pair_configs(avoid: dict, cands: list, base: dict) -> list:
+    """(name, env) for each switch that failed alone, together with every candidate that did not.
+    A switch can need another to work: on 50 Cent TITLE_KEVENTS stalls alone and runs paced to
+    60 Hz once RECOMP_VBLANK=paced is also set. Failed x others keeps the count linear."""
+    return [(f"{x}+{y}", dict(base, **{x: dict(cands)[x], y: v}))
+            for x in avoid for y, v in cands if y != x and y not in avoid]
+
+
+def run_all(exe: Path, out: Path, configs: list, a, repeat: int) -> dict:
+    """Run every (name, env) config `repeat` times and combine each. Rounds are interleaved
     (baseline, switch 1, switch 2, ... then again) so drift on the host hits every config alike:
     on 50 Cent the same build alternates between about 2250 and about 3150 flips in 40 s, and
     running a config's repeats back to back made the baseline look better than every switch.
-    Run dirs are <name>, <name>#2, ...; --reuse re-reads them."""
+    Run dirs are <name>, <name>#2, ...; --reuse re-reads the ones already saved and runs the rest."""
     ms = {name: [] for name, _ in configs}
-    for i in range(1, a.repeat + 1):
+    for i in range(1, repeat + 1):
         for name, env_set in configs:
             n = name if i == 1 else f"{name}#{i}"
-            if a.reuse:
-                d = out / "runs" / n
+            d = out / "runs" / n
+            if a.reuse and (d / "metrics.json").exists():
                 m = read_run(d, json.loads((d / "metrics.json").read_text())["exit"], False)
                 (d / "metrics.json").write_text(json.dumps(m, indent=2))
             else:
@@ -264,6 +272,10 @@ def selftest():
     assert combine([r(1, stalled=True), r(1, stalled=True), r(1)])["stalled"] is True
     assert combine([r(1, stalled=True), r(1), r(1)])["stalled"] is False
     assert paced(59.0) and not paced(89.0)
+    pc = pair_configs({"A": "stalled"}, [("A", "1"), ("B", "2"), ("C", "3")], {"BASE": "1"})
+    assert [n for n, _ in pc] == ["A+B", "A+C"] and pc[0][1] == {"BASE": "1", "A": "1", "B": "2"}
+    assert pair_configs({"A": "x", "B": "y"}, [("A", "1"), ("B", "2"), ("C", "3")], {}) == [
+        ("A+C", {"A": "1", "C": "3"}), ("B+C", {"B": "2", "C": "3"})]  # avoid x avoid is skipped
     print("selftest ok")
 
 
@@ -276,8 +288,10 @@ def main():
     ap.add_argument("--base", default="", help="opt-ins every run has, e.g. RECOMP_AC97_READY=1")
     ap.add_argument("--only", default="", help="comma list of switches to test (default: all candidates)")
     ap.add_argument("--repeat", type=int, default=1, help="runs per config; 3 gives a median and a noise range")
+    ap.add_argument("--pairs", action="store_true", help="re-test switches that failed alone together with each other candidate")
+    ap.add_argument("--pair-repeat", type=int, default=1, help="runs per pair (default 1; pair calls are provisional)")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--reuse", action="store_true", help="reclassify runs already in --out (metrics.json), no launch")
+    ap.add_argument("--reuse", action="store_true", help="use saved runs in --out where present (re-parsed), run the rest")
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -292,7 +306,7 @@ def main():
     if not a.reuse:
         print(f"baseline + {len(cands)} switches, {a.seconds}s x {a.repeat} each -> {out}", flush=True)
     # --reuse re-parses each saved run's output rather than trusting its stored metrics.json.
-    runs = run_all(exe, out, [("baseline", base)] + [(k, dict(base, **{k: v})) for k, v in cands], a)
+    runs = run_all(exe, out, [("baseline", base)] + [(k, dict(base, **{k: v})) for k, v in cands], a, a.repeat)
 
     audio_expected = any(r["frames"] > 0 for r in runs.values())
     b = runs["baseline"]
@@ -309,6 +323,23 @@ def main():
             # Harmful on this base, not everywhere: TITLE_KEVENTS stalls alone but works once VBLANK
             # is on. So it is listed, never written as "off" for the gate.
             avoid[k] = why
+
+    # Pair stage: re-test the switches that failed alone together with each one that did not.
+    pairs = {}
+    if a.pairs and avoid:
+        pcfg = pair_configs(avoid, cands, base)
+        print(f"\npair stage: {len(pcfg)} pairs, {a.seconds}s x {a.pair_repeat} each", flush=True)
+        pruns = run_all(exe, out, [("pair-baseline", base)] + pcfg, a, a.pair_repeat)
+        pb = pruns["pair-baseline"]
+        for name, _ in pcfg:
+            cls, why = classify(pb, pruns[name], audio_expected)
+            x, y = name.split("+")
+            pairs[name] = {"switches": [x, y], "classification": cls, "reason": why, "metrics": pruns[name],
+                           "provisional": a.pair_repeat < 2, "run": f"runs/{name}"}
+            if cls in ("needed", "helpful"):
+                for sw in (x, y):
+                    opt_ins[sw] = dict(CANDIDATES)[sw]
+                avoid.pop(x, None)  # it works in company, so it is no longer an avoid
     result = {
         "probe_version": 1,
         "exe": str(exe),
@@ -319,6 +350,7 @@ def main():
         "switches": switches,
         "opt_ins": opt_ins,
         "avoid_on_this_base": avoid,
+        "pairs": pairs,
         # Not switch results: addresses the lift missed. Seed them before trusting any class above.
         "lift_gaps": sorted({g for r in runs.values() for g in r.get("lift_gaps", [])}),
         "lift_gap_log": "runs/baseline/stderr.txt",
@@ -330,6 +362,8 @@ def main():
     print(f"\n{'switch':28} {'class':10} reason")
     for k, s in switches.items():
         print(f"{k:28} {s['classification']:10} {s['reason']}")
+    for k, s in pairs.items():
+        print(f"{k.replace('RECOMP_', ''):28} {s['classification']:10} {s['reason']}")
     print(f"\nwrote {out / 'recomp_probe.json'}")
 
 
