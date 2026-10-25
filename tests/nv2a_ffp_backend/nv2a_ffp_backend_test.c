@@ -380,6 +380,72 @@ int main(void)
     m(0x0130, 0);                                     /* FLIP_STALL */
     CHECK(s_be.flips == 1);
 
+    /* Decoding a whole texture walks the image (the Morton offset stepped with
+     * the masked increment) instead of sampling each texel; the result has to be
+     * what the per-texel layout says. For every swizzled format and several
+     * shapes (square, wide, tall, one texel wide), the swizzled decode must equal
+     * the decode of the same texels laid out linearly with a padded pitch. */
+    {
+        static const struct { uint32_t sz, lin, bpp; } F[] = {
+            { 0x00, 0x13, 1 }, { 0x02, 0x10, 2 }, { 0x03, 0x1C, 2 }, { 0x04, 0x1D, 2 },
+            { 0x05, 0x11, 2 }, { 0x06, 0x12, 4 }, { 0x07, 0x1E, 4 }, { 0x19, 0x1F, 1 },
+        };
+        static const uint32_t S[][2] = { {16, 8}, {8, 16}, {32, 4}, {4, 32}, {1, 16}, {16, 1}, {64, 64} };
+        static uint8_t lin[64 * 64 * 4];
+        static uint32_t a[64 * 64], b[64 * 64];
+        uint32_t fi, si, k;
+        int all_ok = 1;
+
+        for (fi = 0; fi < sizeof F / sizeof F[0]; fi++)
+            for (si = 0; si < sizeof S / sizeof S[0]; si++) {
+                const uint32_t w = S[si][0], h = S[si][1], bpp = F[fi].bpp;
+                const uint32_t pitch = w * bpp + 16;         /* padded: pitch is not width * bpp */
+                Nv2aTexture tx;
+                uint32_t y;
+
+                for (k = 0; k < w * h * bpp; k++)
+                    lin[k] = (uint8_t)(k * 2654435761u >> 11);
+                xbox_swizzle_rect(s_mem + 0x1000, lin, w, h, bpp);
+                memset(&tx, 0, sizeof tx);
+                tx.offset = 0x1000; tx.width = w; tx.height = h; tx.pitch = w * bpp;
+                tx.color = F[fi].sz; tx.levels = 1;
+                memset(a, 0xA5, sizeof a);
+                all_ok &= nv2a_backend_decode_texture(&tx, a) == 1;
+
+                for (y = 0; y < h; y++)
+                    memcpy(s_mem + 0x8000 + y * pitch, lin + y * w * bpp, w * bpp);
+                tx.offset = 0x8000; tx.pitch = pitch; tx.color = F[fi].lin;
+                memset(b, 0x5A, sizeof b);
+                all_ok &= nv2a_backend_decode_texture(&tx, b) == 1;
+                all_ok &= memcmp(a, b, (size_t)w * h * 4) == 0;
+            }
+        CHECK(all_ok);
+    }
+
+    /* The known values, so a decode that is wrong the same way in both layouts
+     * is still caught: a swizzled 16x8 A8R8G8B8 and a swizzled 32x8 L8. */
+    {
+        uint32_t lin32[16 * 8], got[32 * 8];
+        uint8_t lin8[32 * 8];
+        Nv2aTexture tx;
+
+        for (i = 0; i < 16 * 8; i++)
+            lin32[i] = 0xFF000000u | (i * 2654435761u >> 8);
+        xbox_swizzle_rect(s_mem + 0x7000, lin32, 16, 8, 4);
+        memset(&tx, 0, sizeof tx);
+        tx.offset = 0x7000; tx.width = 16; tx.height = 8; tx.pitch = 64; tx.color = 0x06; tx.levels = 1;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        CHECK(memcmp(got, lin32, sizeof lin32) == 0);
+
+        for (i = 0; i < 32 * 8; i++)
+            lin8[i] = (uint8_t)(i * 37u + 5u);
+        xbox_swizzle_rect(s_mem + 0x7800, lin8, 32, 8, 1);
+        tx.offset = 0x7800; tx.width = 32; tx.height = 8; tx.color = 0x00;
+        CHECK(nv2a_backend_decode_texture(&tx, got) == 1);
+        for (i = 0; i < 32 * 8; i++)
+            CHECK(got[i] == (0xFF000000u | lin8[i] * 0x010101u));
+    }
+
     if (!s_fail)
         printf("nv2a fixed-function path through a back end: ok\n");
     return s_fail;
