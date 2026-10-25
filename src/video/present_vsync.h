@@ -19,7 +19,7 @@ static inline int present_vsync_on(void)
 
     if (!e)
         return 1;
-    return *e != '0';   /* empty: off on POSIX; on Windows it is unset */
+    return *e && *e != '0';   /* empty: off (POSIX; Windows never sees it) */
 }
 
 #endif
