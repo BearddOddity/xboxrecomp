@@ -74,6 +74,30 @@ int main(int argc, char **argv)
         check(l <= cap && l >= 0, "rounded output stays inside the ceiling");
     }
 
+    {   /* RECOMP_APU_MIXSTAT is set by CMake, so the stage has been counting */
+        MCPXMixStats st;
+        int k;
+
+        for (k = 0; k < 3; k++) mcpx_apu_note_frame(APU_FRAME_FULL);
+        for (k = 0; k < 2; k++) mcpx_apu_note_frame(APU_FRAME_SILENT_COUNTER_OFF);
+        mcpx_apu_note_frame(-1);                     /* out of range: ignored */
+        mcpx_apu_note_frame(APU_FRAME_KINDS);
+        mcpx_apu_mix_stats(&st, 0);
+        check(st.peak >= 2.0f, "stats: raw peak is read before the limiter");
+        check(st.over_full_scale > 0, "stats: samples over full scale are counted");
+        if (c > 0.0f)
+            check(st.limited > 0, "stats: limited samples are counted");
+        else
+            check(st.limited == 0, "stats: nothing limited when the limiter is off");
+        check(st.frames[APU_FRAME_FULL] == 3 &&
+              st.frames[APU_FRAME_SILENT_COUNTER_OFF] == 2 &&
+              st.frames[APU_FRAME_TRAPPED] == 0, "stats: frames counted by kind");
+        mcpx_apu_mix_stats(&st, 1);                  /* read and clear */
+        mcpx_apu_mix_stats(&st, 0);
+        check(st.samples == 0 && st.peak == 0.0f && st.frames[APU_FRAME_FULL] == 0,
+              "stats: reset clears everything");
+    }
+
     mcpx_apu_set_master_gain(1.0f);                  /* the setters are safe to call */
     mcpx_apu_set_class_gain(9, 2.0f);                /* out-of-range class ignored */
     mcpx_apu_set_voice_class(-1, 3);

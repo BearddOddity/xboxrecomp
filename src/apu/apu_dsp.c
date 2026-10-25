@@ -143,6 +143,30 @@ static float s_lim_gain = 1.0f;
 static unsigned long long s_st_samples, s_st_over, s_st_limited;
 static float s_st_peak;
 static int s_st_secs = -1;
+static unsigned long long s_fr[APU_FRAME_KINDS];   /* frames by what the thread did */
+
+void mcpx_apu_note_frame(int kind)
+{
+    if (kind >= 0 && kind < APU_FRAME_KINDS) s_fr[kind]++;
+}
+
+/* Read, and with reset set clear, the counters behind the [APU-MIX] report. */
+void mcpx_apu_mix_stats(MCPXMixStats *out, int reset)
+{
+    int k;
+
+    if (!out) return;
+    out->samples = s_st_samples;
+    out->over_full_scale = s_st_over;
+    out->limited = s_st_limited;
+    out->peak = s_st_peak;
+    for (k = 0; k < APU_FRAME_KINDS; k++) out->frames[k] = s_fr[k];
+    if (reset) {
+        s_st_samples = s_st_over = s_st_limited = 0;
+        s_st_peak = 0.0f;
+        memset(s_fr, 0, sizeof s_fr);
+    }
+}
 
 void mcpx_apu_set_limiter(float ceiling)
 {
@@ -180,13 +204,28 @@ void mcpx_apu_output_stage(float l, float r, int16_t *out_l, int16_t *out_r)
         if (raw > s_st_peak) s_st_peak = raw;
         if (raw > 1.0f) s_st_over++;
         if (++s_st_samples >= 48000ull * (unsigned)s_st_secs) {
+            MCPXMixStats st;
+
+            mcpx_apu_mix_stats(&st, 1);
             fprintf(stderr, "[APU-MIX] %llu samples: raw peak %.2f (%+.1f dBFS),"
-                            " over full scale %llu, limited %llu\n",
-                    s_st_samples, s_st_peak,
-                    s_st_peak > 0.0f ? 20.0f * log10f(s_st_peak) : -120.0f,
-                    s_st_over, s_st_limited);
-            s_st_samples = s_st_over = s_st_limited = 0;
-            s_st_peak = 0.0f;
+                            " over full scale %llu (%.3f%%), limited %llu (%.3f%%)\n",
+                    st.samples, st.peak,
+                    st.peak > 0.0f ? 20.0f * log10f(st.peak) : -120.0f,
+                    st.over_full_scale, 100.0 * st.over_full_scale / st.samples,
+                    st.limited, 100.0 * st.limited / st.samples);
+            /* Frames the thread rendered silent because the title switched
+             * the sample counter off: the symptom of DirectSound recovering
+             * a DSP it thinks is dead, on every DoWork. */
+            fprintf(stderr, "[APU-MIX] frames: full %llu, front end trapped %llu,"
+                            " silent %llu (sample counter off %llu, halted %llu,"
+                            " test tone %llu)\n",
+                    st.frames[APU_FRAME_FULL], st.frames[APU_FRAME_TRAPPED],
+                    st.frames[APU_FRAME_SILENT_COUNTER_OFF]
+                        + st.frames[APU_FRAME_SILENT_HALTED]
+                        + st.frames[APU_FRAME_SILENT_OTHER],
+                    st.frames[APU_FRAME_SILENT_COUNTER_OFF],
+                    st.frames[APU_FRAME_SILENT_HALTED],
+                    st.frames[APU_FRAME_SILENT_OTHER]);
         }
     }
 

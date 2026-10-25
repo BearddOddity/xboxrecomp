@@ -384,14 +384,25 @@ patch. It is now in the SDK, off by default, so a newly recompiled title can
 turn on one switch.
 
 1. Measure first. `RECOMP_APU_MIXSTAT=10` prints, every 10 seconds of output,
-   `[APU-MIX] <samples>: raw peak <x> (<dBFS>), over full scale <n>, limited <n>`.
-   A title whose raw peak stays under 1.0 has nothing to fix.
+   `[APU-MIX] <samples>: raw peak <x> (<dBFS>), over full scale <n> (<%>), limited <n> (<%>)`
+   and `[APU-MIX] frames: full <n>, front end trapped <n>, silent <n> (sample
+   counter off <n>, halted <n>, test tone <n>)`. A title whose raw peak stays
+   under 1.0 has nothing to fix in the mix. Frames "silent, sample counter
+   off" are APU frames rendered as silence because the title switched the
+   sample counter off: DirectSound recovering a DSP it thinks is dead (see
+   `RECOMP_APU_DSP_ALIVE` below). 50 Cent: Bulletproof showed 136 and 40 of
+   them per 30 seconds with the alive word off, and 0 with it on. The same
+   numbers are available to an overlay from `mcpx_apu_mix_stats()` (`apu.h`).
 2. Turn it on. `RECOMP_SAGE=1` replaces the clamp with a soft limiter
    (ceiling 0.95 of full scale): the gain falls over about 12 samples when a
    peak would pass the ceiling, so there is no click, and recovers over about
    100 ms; what is left above the ceiling goes through a tanh knee that cannot
    pass it. Output is also rounded to 16 bits rather than truncated. A mix
-   that never reaches the ceiling is untouched.
+   that never reaches the ceiling is untouched. On Windows SAGE also asks for
+   1 ms timer resolution for the life of the APU: at the default 15.6 ms tick
+   the frame thread's 1 ms waits take 15 ms and the device queue starves
+   (Hulk: Ultimate Destruction went from 650 to 72 underruns a minute on that
+   alone). The log says `[APU] SAGE: 1 ms timer resolution`.
 3. Tune it. `RECOMP_AUDIO_LIMITER=<0.1..1.0>` sets the ceiling alone, and `0`
    turns the limiter off even under SAGE. Closer to the intended balance:
    `RECOMP_AUDIO_VOL_MASTER` and `RECOMP_AUDIO_VOL_CLASS0..7` (linear, 1.0 =
@@ -419,9 +430,9 @@ where it is not.
 
 `SECTL` toggling alone does not mean a recovery: DirectSound also pauses and
 resumes the engine (`SECTL` 7, then 0xF) in its interrupt handler, many times
-a second on a healthy title. A recovery is told apart by the stall it adds
-to the calling thread and, in a title that has one, by the guest's own
-recovery counter.
+a second on a healthy title. A recovery is told apart by the silent frames
+it causes: watch `frames: ... silent ... (sample counter off <n>)` under
+`RECOMP_APU_MIXSTAT`, which stays at 0 on a healthy title.
 
 To tell a fix is working, record with `RECOMP_AUDIO_WAV` and count the runs
 of exact-zero samples with loud audio on both sides: that is the silenced

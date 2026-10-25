@@ -535,6 +535,7 @@ static struct {
 #if defined(_WIN32)
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+static int s_sage_timer;        /* timeBeginPeriod(1) is held (RECOMP_SAGE) */
 #endif
 /* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
  * waveOut fallback path stays inactive and never produces audio. */
@@ -566,6 +567,17 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+
+#if defined(_WIN32)
+    /* RECOMP_SAGE: ask for 1 ms timers. At the default 15.6 ms tick the frame
+     * thread's 1 ms waits take 15 ms and the title's own waits are as coarse,
+     * which starves the device queue: Hulk: Ultimate Destruction went from 650
+     * to 72 underruns a minute on this alone. Released at shutdown. */
+    if (apu_env_on("RECOMP_SAGE") && timeBeginPeriod(1) == TIMERR_NOERROR) {
+        s_sage_timer = 1;
+        fprintf(stderr, "[APU] SAGE: 1 ms timer resolution\n");
+    }
+#endif
 
     /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given,
      * capped at RECOMP_AUDIO_WAV_SECS seconds when that is set. */
@@ -631,6 +643,12 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
     apu_wav_close();
+#if defined(_WIN32)
+    if (s_sage_timer) {
+        timeEndPeriod(1);
+        s_sage_timer = 0;
+    }
+#endif
     if (xa2_is_active()) {
         xa2_shutdown();
         return;
@@ -1246,6 +1264,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+            mcpx_apu_note_frame(APU_FRAME_FULL);
         } else if (fe_trapped) {
             /* The title has the APU on, but the front end is trapped (a voice
              * went idle under FETFORCE1) and stays so until DirectSound's
@@ -1261,8 +1280,13 @@ static void *mcpx_apu_frame_thread(void *arg)
              * zero in streamed music every few seconds). The interrupt is
              * delivered below; the wait is after it. */
             apu_irq_stats.fe_trapped_frames++;
+            mcpx_apu_note_frame(APU_FRAME_TRAPPED);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            mcpx_apu_note_frame(g_test_tone.active ? APU_FRAME_SILENT_OTHER
+                                : xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF
+                                    ? APU_FRAME_SILENT_COUNTER_OFF
+                                    : APU_FRAME_SILENT_HALTED);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

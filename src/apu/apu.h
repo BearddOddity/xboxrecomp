@@ -54,6 +54,28 @@ void mcpx_apu_set_class_gain(int cls, float gain);
 void mcpx_apu_set_voice_class(int voice, int cls);   /* cls -1: back to default */
 void mcpx_apu_set_limiter(float ceiling);            /* 0.1..1.0, or 0 for off */
 
+/* What the mix and the frame thread did since the last reset, for an overlay
+ * or a log: the same numbers RECOMP_APU_MIXSTAT prints. over_full_scale is
+ * counted before the limiter, so it says whether the title needs SAGE.
+ * frames[] counts the thread's frames by kind; APU_FRAME_SILENT_COUNTER_OFF
+ * climbing is a title "recovering" a DSP it thinks is dead (see
+ * RECOMP_APU_DSP_ALIVE in docs/pipeline/06-debugging.md). */
+enum {
+    APU_FRAME_FULL,                 /* the whole pipeline ran */
+    APU_FRAME_TRAPPED,              /* front end trapped: no frame, as xemu */
+    APU_FRAME_SILENT_COUNTER_OFF,   /* lightweight: SECTL sample counter off */
+    APU_FRAME_SILENT_HALTED,        /* lightweight: front end halted */
+    APU_FRAME_SILENT_OTHER,         /* lightweight: test tone */
+    APU_FRAME_KINDS
+};
+typedef struct MCPXMixStats {
+    unsigned long long samples, over_full_scale, limited;
+    float peak;                                  /* raw, before the limiter */
+    unsigned long long frames[APU_FRAME_KINDS];
+} MCPXMixStats;
+void mcpx_apu_mix_stats(MCPXMixStats *out, int reset);
+void mcpx_apu_note_frame(int kind);              /* the frame thread's own call */
+
 /* A diagnostic switch (RECOMP_APU_TRACE, RECOMP_APU_RING, ...) is on when
  * set, non-empty and not starting with '0'. */
 int apu_env_on(const char *name);
