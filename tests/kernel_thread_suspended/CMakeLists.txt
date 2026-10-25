@@ -13,3 +13,8 @@ set(XBE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
 # modes are kept apart like the other kernel tests.
 add_test(NAME kernel_thread_suspended_default COMMAND kernel_thread_suspended_test default ${XBE})
 add_test(NAME kernel_thread_suspended_honor COMMAND kernel_thread_suspended_test honor ${XBE})
+# =0 is off, as for every other RECOMP_* switch; and a worker the title never
+# resumes is started after RECOMP_HONOR_SUSPEND_MS instead of hanging it.
+add_test(NAME kernel_thread_suspended_zero COMMAND kernel_thread_suspended_test zero ${XBE})
+add_test(NAME kernel_thread_suspended_guard COMMAND kernel_thread_suspended_test guard ${XBE})
+add_test(NAME kernel_thread_suspended_parked COMMAND kernel_thread_suspended_test parked ${XBE})

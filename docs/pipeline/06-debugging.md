@@ -351,6 +351,27 @@ usually moves the stall rather than fixing it. Find the probe that failed.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
 
+## Thread Startup: RECOMP_HONOR_SUSPEND
+
+XAPI's `CreateThread` always calls `PsCreateSystemThreadEx` with
+`CreateSuspended`, stores the new handle where the thread can see it, and only
+then calls `NtResumeThread`. By default the SDK ignores `CreateSuspended` and
+runs the worker at once, so a worker that reads the title's thread-handle
+globals first sees them unset. Symptom (50 Cent: Bulletproof): `NtResumeThread`
+returns status -1 on handle 0 and a suspend/resume handshake between the
+engine threads spins for millions of calls (`ordinal 224` and `231` in the
+kernel call summary), with frames never leaving the first screen.
+
+- `RECOMP_HONOR_SUSPEND=1` starts a worker created suspended, suspended, and
+  leaves it to the title's `NtResumeThread`. Off by default; `=0` or empty is
+  off, as for every `RECOMP_*` switch.
+- A title that never resumes a thread it created suspended would hang with
+  that worker parked, so one the title has not resumed after
+  `RECOMP_HONOR_SUSPEND_MS` (default 3000) is started anyway, with a
+  `[KERNEL] RECOMP_HONOR_SUSPEND: a worker created suspended was never
+  resumed` line. A worker the title resumed and later parked itself is left
+  alone.
+
 ## Audio Behaviour Switches
 
 Crackle that is not the host's fault has so far come from three places.

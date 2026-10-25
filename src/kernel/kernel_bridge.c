@@ -767,6 +767,97 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     return 0;
 }
 
+/* A switch is on when set, non-empty and not starting with '0', as every
+ * other RECOMP_* switch reads: =0 turns it off. */
+static int bridge_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
+/* RECOMP_HONOR_SUSPEND starts a CreateSuspended worker suspended and leaves
+ * the title to resume it. A title that never resumes one it created suspended
+ * would hang with that worker parked, so the worker is started anyway if
+ * nothing has resumed it after RECOMP_HONOR_SUSPEND_MS (default 3000). */
+struct bridge_suspend_guard { HANDLE th; DWORD ms; HANDLE key; };
+
+/* Host thread handles (as the title's handle token resolves to them) of
+ * workers created suspended and not yet resumed by the title.
+ * NtResumeThread clears its entry (bridge_note_resumed), so the guard starts
+ * only a thread the title never resumed -- not one it resumed and later
+ * parked itself, as 50 Cent's suspend/resume handshake does. */
+#define BRIDGE_PENDING_MAX 64
+static PVOID volatile g_pending_resume[BRIDGE_PENDING_MAX];
+
+static void bridge_pending_add(HANDLE key)
+{
+    int i;
+    for (i = 0; i < BRIDGE_PENDING_MAX; i++)
+        if (InterlockedCompareExchangePointer(&g_pending_resume[i], key, NULL) == NULL)
+            return;
+}
+
+/* Returns 1 if the thread was pending (and no longer is). */
+static int bridge_pending_take(HANDLE key)
+{
+    int i;
+    for (i = 0; i < BRIDGE_PENDING_MAX; i++)
+        if (InterlockedCompareExchangePointer(&g_pending_resume[i], NULL, key) == key)
+            return 1;
+    return 0;
+}
+
+static void bridge_note_resumed(HANDLE h)
+{
+    if (h) bridge_pending_take(h);
+}
+
+static DWORD WINAPI bridge_suspend_guard_main(LPVOID param)
+{
+    struct bridge_suspend_guard g = *(struct bridge_suspend_guard *)param;
+    DWORD prev;
+
+    free(param);
+    Sleep(g.ms);
+    if (!bridge_pending_take(g.key)) {   /* the title resumed it */
+        CloseHandle(g.th);
+        return 0;
+    }
+    prev = SuspendThread(g.th);          /* the count it had before this */
+    if (prev != (DWORD)-1) {
+        /* prev 0: running, undo the probe. prev >= 1: still parked, so undo
+         * the probe and the title's own suspend count to start it. */
+        DWORD n = prev + 1;
+        while (n--) ResumeThread(g.th);
+        if (prev)
+            fprintf(stderr, "  [KERNEL] RECOMP_HONOR_SUSPEND: a worker created"
+                            " suspended was never resumed in %lu ms; started\n",
+                    (unsigned long)g.ms);
+    }
+    CloseHandle(g.th);
+    return 0;
+}
+
+static void bridge_guard_suspended(HANDLE th)
+{
+    struct bridge_suspend_guard *g = malloc(sizeof(*g));
+    const char *e = getenv("RECOMP_HONOR_SUSPEND_MS");
+    HANDLE gt;
+
+    if (!g) return;
+    g->ms = (e && *e) ? (DWORD)atoi(e) : 3000;
+    g->key = th;
+    bridge_pending_add(g->key);
+    if (!DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(), &g->th,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        free(g);
+        return;
+    }
+    gt = CreateThread(NULL, 0, bridge_suspend_guard_main, g, 0, NULL);
+    if (gt) CloseHandle(gt);
+    else { CloseHandle(g->th); free(g); }
+}
+
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
                                   uint32_t obj_va, uint32_t tls_size,
@@ -786,7 +877,11 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
-    else xbox_set_game_thread(th);
+    else {
+        xbox_set_game_thread(th);
+        if (suspended)
+            bridge_guard_suspended(th);
+    }
     return th;
 }
 
@@ -849,7 +944,7 @@ static void bridge_PsCreateSystemThreadEx(void)
      * globals before they are written (50 Cent: Bulletproof's worker resumes
      * handle 0 and its tick handshake never completes). Opt-in: a title that
      * never resumes a thread it created suspended would hang. */
-    int create_suspended = STACK_ARG(7) && getenv("RECOMP_HONOR_SUSPEND") != NULL;
+    int create_suspended = STACK_ARG(7) && bridge_env_on("RECOMP_HONOR_SUSPEND");
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
@@ -5652,9 +5747,11 @@ static void bridge_NtSuspendThread(void)
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+
+    bridge_note_resumed(h);
     g_eax = (uint32_t)xbox_NtResumeThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+        h, (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
 }
 
 /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
@@ -8541,6 +8638,7 @@ static void bridge_KeResumeThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
+    bridge_note_resumed(hThread);
     if (hThread)
         g_eax = (uint32_t)ResumeThread(hThread);
     else
