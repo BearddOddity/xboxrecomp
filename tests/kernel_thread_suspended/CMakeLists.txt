@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_thread_suspended_test C)
+if(NOT WIN32)
+    message(STATUS "tests/kernel_thread_suspended skipped: Windows only")
+    return()
+endif()
 # Windows only: PsCreateSystemThreadEx spawns a Win32 thread.
 set(CMAKE_C_STANDARD 11)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

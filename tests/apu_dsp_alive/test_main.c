@@ -4,6 +4,7 @@
  * be stored there when the aperture is made. Run three ways (CMakeLists.txt):
  * default, =0, and a moved address. */
 #include "apu_state.h"
+#include "apu.h"
 #include "apu_shim.h"
 
 #include <stdio.h>

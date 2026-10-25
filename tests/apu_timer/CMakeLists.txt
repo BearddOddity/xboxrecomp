@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_timer_test C)
+if(NOT WIN32)
+    message(STATUS "tests/apu_timer skipped: Windows only")
+    return()
+endif()
 # Windows only: RECOMP_SAGE asks for 1 ms timers while the APU is up. Times
 # Sleep(1) before init, with the APU running, and after shutdown.
 set(CMAKE_C_STANDARD 11)
