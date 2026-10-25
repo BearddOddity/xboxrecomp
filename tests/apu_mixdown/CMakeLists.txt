@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_mixdown_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_mixdown_test test_main.c)
 target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
 # The whole runtime: the APU delivers its interrupt and resolves physical

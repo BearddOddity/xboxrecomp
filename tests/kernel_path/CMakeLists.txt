@@ -3,7 +3,9 @@ project(kernel_path_test C)
 # Cross-platform: the path layer called directly, so it covers the Win32
 # backend on Windows/Proton and the POSIX one elsewhere.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_path_test test_main.c)
 target_include_directories(kernel_path_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_path_test PRIVATE xboxrecomp)

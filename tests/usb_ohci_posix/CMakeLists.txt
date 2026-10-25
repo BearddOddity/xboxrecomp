@@ -4,11 +4,17 @@ project(usb_ohci_posix_test C)
 # SIGBUS/SIGSEGV handler and the A64 decoder. Needs a POSIX arm64 host;
 # elsewhere the model stays off by design and the test exits 77 (skipped).
 if(WIN32)
-    message(FATAL_ERROR "This regression covers the POSIX trap path")
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        message(FATAL_ERROR "This regression covers the POSIX trap path")
+    endif()
+    message(STATUS "tests/usb_ohci_posix skipped: " "This regression covers the POSIX trap path")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 
 # The guest window needs an XBE header to map; the synthetic one is enough.
 set(TEST_XBE ${CMAKE_CURRENT_BINARY_DIR}/test.xbe)

@@ -4,7 +4,11 @@ project(input_keyboard_sdl_regression C)
 # with synthetic events, POSIX only. Links the two key files and SDL2, not
 # the presenter; SDL runs on its dummy video driver, so no display is needed.
 if(WIN32)
-    message(FATAL_ERROR "The SDL keyboard path is POSIX-only")
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        message(FATAL_ERROR "The SDL keyboard path is POSIX-only")
+    endif()
+    message(STATUS "tests/input_keyboard_sdl skipped: " "The SDL keyboard path is POSIX-only")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
 find_package(SDL2 REQUIRED)

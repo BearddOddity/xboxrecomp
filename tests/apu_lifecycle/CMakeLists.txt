@@ -4,7 +4,9 @@ project(apu_lifecycle_test C)
 # the DSP doorbell gate and its configuration start fresh on every init, and
 # shutdown releases the GP/EP state once, after the frame thread has stopped.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_lifecycle_test test_main.c)
 target_include_directories(apu_lifecycle_test PRIVATE ../../src ../../src/apu)
 # test_main.c defines every xa2_* function, so no host audio device is opened.

@@ -3,7 +3,9 @@ project(apu_output_test C)
 # The last stage between the mix and the device: the old clamp by default,
 # the soft limiter under RECOMP_SAGE / RECOMP_AUDIO_LIMITER.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_output_test test_main.c)
 target_include_directories(apu_output_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(apu_output_test PRIVATE xboxrecomp)

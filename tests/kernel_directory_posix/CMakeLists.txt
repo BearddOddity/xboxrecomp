@@ -1,12 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_directory_posix C)
 if(WIN32)
-    message(FATAL_ERROR "This fixture exercises the POSIX directory-search backend")
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        message(FATAL_ERROR "This fixture exercises the POSIX directory-search backend")
+    endif()
+    message(STATUS "tests/kernel_directory_posix skipped: " "This fixture exercises the POSIX directory-search backend")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
 # Build only real file/path and platform code: no game, renderer, guest-memory
 # layout or #189 prerequisite is needed to test directory-handle lifetime.
-add_subdirectory(../../src/platform platform)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../../src/platform platform)
+endif()
 add_executable(kernel_directory_posix_test test_main.c
     ../../src/kernel/kernel_file.c ../../src/kernel/kernel_path.c)
 target_include_directories(kernel_directory_posix_test PRIVATE ../../src/kernel)

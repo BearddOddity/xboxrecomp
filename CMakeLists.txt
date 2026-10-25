@@ -80,3 +80,12 @@ else()
     target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
 endif()
 
+
+# The whole test suite in one build tree and one ctest run:
+#   cmake -S . -B build -DXBOXRECOMP_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
+# Each test folder still builds alone (cmake -S tests/<name> -B ...).
+option(XBOXRECOMP_BUILD_TESTS "Build every test into this tree" OFF)
+if(XBOXRECOMP_BUILD_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
