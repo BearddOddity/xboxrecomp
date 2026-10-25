@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_timer_test C)
+# Windows only: RECOMP_SAGE asks for 1 ms timers while the APU is up. Times
+# Sleep(1) before init, with the APU running, and after shutdown.
+set(CMAKE_C_STANDARD 11)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_subdirectory(../.. runtime)
+endif()
+add_executable(apu_timer_test test_main.c)
+target_include_directories(apu_timer_test PRIVATE ../../src ../../src/apu)
+target_link_libraries(apu_timer_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME apu_timer_sage COMMAND apu_timer_test on)
+add_test(NAME apu_timer_default COMMAND apu_timer_test off)
+set_tests_properties(apu_timer_sage PROPERTIES ENVIRONMENT "RECOMP_SAGE=1")
+set_tests_properties(apu_timer_default PROPERTIES ENVIRONMENT "RECOMP_SAGE=")

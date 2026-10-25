@@ -399,10 +399,16 @@ turn on one switch.
    100 ms; what is left above the ceiling goes through a tanh knee that cannot
    pass it. Output is also rounded to 16 bits rather than truncated. A mix
    that never reaches the ceiling is untouched. On Windows SAGE also asks for
-   1 ms timer resolution for the life of the APU: at the default 15.6 ms tick
-   the frame thread's 1 ms waits take 15 ms and the device queue starves
-   (Hulk: Ultimate Destruction went from 650 to 72 underruns a minute on that
-   alone). The log says `[APU] SAGE: 1 ms timer resolution`.
+   1 ms timer resolution for the life of the APU, and gives it back at
+   shutdown. Measured in-process (`tests/apu_timer`), `Sleep(1)` averages 15.3
+   ms by default, 1.8 ms with SAGE. Windows 11 keeps timer resolution per
+   process, so another program holding a 1 ms tick does not help the title.
+   What that buys depends on how timer-bound the title is: Hulk: Ultimate
+   Destruction went from 650 to 72 underruns a minute on it alone, while 50
+   Cent: Bulletproof's intro, with every core saturated by other work, showed
+   no difference (227 underruns against 215), because there the starvation is
+   CPU time, not timer granularity. It costs a little power. The log says
+   `[APU] SAGE: 1 ms timer resolution`.
 3. Tune it. `RECOMP_AUDIO_LIMITER=<0.1..1.0>` sets the ceiling alone, and `0`
    turns the limiter off even under SAGE. Closer to the intended balance:
    `RECOMP_AUDIO_VOL_MASTER` and `RECOMP_AUDIO_VOL_CLASS0..7` (linear, 1.0 =
