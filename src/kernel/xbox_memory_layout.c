@@ -3253,6 +3253,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_mcpx_memory = layout_commit_at((LPVOID)mcpx_native, XBOX_MCPX_SIZE);
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
+            /* DirectSoundDoWork reads the encode DSP's alive word back out of
+             * EP memory; stored here because that memory is plain RAM. */
+            mcpx_apu_seed_dsp_memory(g_mcpx_memory, XBOX_MCPX_SIZE);
             /* AC'97 codec ready.
              *
              * DirectSound resets the codec by setting a bit in 0xFEC0012C and

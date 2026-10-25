@@ -175,9 +175,10 @@ int apu_env_on(const char *name)
  * periods (crackle), and each call stalled the calling thread. True Crime:
  * NYC and Hulk: Ultimate Destruction both hit it and both patched the title.
  *
- * The word is read back as 0xCCCCCC. RECOMP_APU_DSP_ALIVE=0 (or off)
- * restores the old read-as-zero; any other value is the EP-relative or
- * absolute address (hex) of the word for an XDK that keeps it elsewhere. */
+ * The word is stored as 0xCCCCCC when the aperture is created
+ * (mcpx_apu_seed_dsp_memory). RECOMP_APU_DSP_ALIVE=0 (or off) leaves it 0;
+ * any other value is the EP-relative or absolute address (hex) of the word
+ * for an XDK that keeps it elsewhere. */
 #define APU_DSP_ALIVE_WORD   0x00CCCCCCu
 #define APU_DSP_ALIVE_OFFSET 0x5A018    /* 0xFE85A018 - 0xFE800000 */
 #define APU_BASE_PHYS        0xFE800000u
@@ -202,18 +203,20 @@ int64_t apu_dsp_alive_offset(void)
     return off;
 }
 
-/* The value an access to the alive word reads, or 0 and *hit unset. */
-static uint64_t apu_dsp_alive_read(uint64_t addr, unsigned size, int *hit)
+/* Write the alive word into the MCPX aperture (the 512K at 0xFE800000, as
+ * host memory). GP and EP memory (0x30000 and up) are plain RAM here, not
+ * trapped, so the word is stored rather than answered on a read; the title
+ * reads it straight out of the aperture. Returns 1 if it was stored, 0 when
+ * the switch is off or the address is not in GP/EP RAM. */
+int mcpx_apu_seed_dsp_memory(void *aperture, size_t size)
 {
-    int64_t a = apu_dsp_alive_offset();
-    *hit = 0;
-    if (a < 0 || addr < (uint64_t)a || addr >= (uint64_t)a + 4)
+    int64_t off = apu_dsp_alive_offset();
+    uint32_t w = APU_DSP_ALIVE_WORD;
+
+    if (!aperture || off < 0x30000 || (uint64_t)off + 4 > size)
         return 0;
-    *hit = 1;
-    {
-        uint64_t v = APU_DSP_ALIVE_WORD >> ((addr - (uint64_t)a) * 8);
-        return size >= 4 ? v : v & ((1ull << (size * 8)) - 1);
-    }
+    memcpy((char *)aperture + off, &w, 4);
+    return 1;
 }
 
 /* Safety net for a title whose "DSP alive" check this model does not
@@ -1561,11 +1564,6 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
-    } else {
-        int hit;
-        uint64_t v = apu_dsp_alive_read(addr, size, &hit);
-        if (hit)
-            return v;
     }
     return 0;
 }

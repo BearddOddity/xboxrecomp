@@ -359,7 +359,7 @@ where it is not.
 
 | Symptom | Cause | Default | Switch |
 |---------|-------|---------|--------|
-| Periods of digital silence, a 10 ms stall about 66 times a second, `SECTL` toggling in the trace | DirectSound's `DirectSoundDoWork` reads the encode DSP's "alive" word (EP memory `0xFE85A018`) and, finding anything but `0xCCCCCC`, resets the DSP. No DSP program runs here, so it read 0. True Crime: NYC and Hulk: Ultimate Destruction both hit it. | the word reads `0xCCCCCC` | `RECOMP_APU_DSP_ALIVE=0` restores read-as-zero; `=<hex>` names another address (EP offset or absolute `0xFE8xxxxx`) for an XDK that keeps the word elsewhere |
+| Periods of digital silence, a 10 ms stall about 66 times a second, `SECTL` toggling in the trace | DirectSound's `DirectSoundDoWork` reads the encode DSP's "alive" word (EP memory `0xFE85A018`) and, finding anything but `0xCCCCCC`, resets the DSP. No DSP program runs here, so it read 0. True Crime: NYC and Hulk: Ultimate Destruction both hit it. | the word is stored as `0xCCCCCC` when the MCPX aperture is created (GP/EP memory is plain RAM) | `RECOMP_APU_DSP_ALIVE=0` leaves it 0; `=<hex>` names another address (EP offset or absolute `0xFE8xxxxx`) for an XDK that keeps the word elsewhere |
 | Crackle in borderless fullscreen only, clean windowed; no underruns reported | Each `Present` waits for vblank, the 43 ms device queue reaches its low mark, and the pacer renders ahead in a burst that carries a voice's play cursor past the title's own stream writes | 6 XAudio2 buffers (64 ms) | `RECOMP_AUDIO_BUF_COUNT=<2..8>` sets the depth; `RECOMP_AUDIO_AHEAD_PERIODS=<n>` caps the render-ahead at n 256-sample periods |
 
 If the sample counter is switched off 20 times within 2 seconds the APU

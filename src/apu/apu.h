@@ -27,6 +27,12 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* Store the DSP "alive" word (0xCCCCCC at 0xFE85A018, which every XDK
+ * DirectSound reads back in DirectSoundDoWork) into the MCPX aperture, whose
+ * GP/EP memory is plain RAM. Call once when the aperture is created; see
+ * RECOMP_APU_DSP_ALIVE in docs/pipeline/06-debugging.md. Returns 1 if stored. */
+int mcpx_apu_seed_dsp_memory(void *aperture, size_t size);
+
 /* A diagnostic switch (RECOMP_APU_TRACE, RECOMP_APU_RING, ...) is on when
  * set, non-empty and not starting with '0'. */
 int apu_env_on(const char *name);

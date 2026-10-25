@@ -1,7 +1,8 @@
 /* DirectSound's DoWork reads one word of EP memory and, when it is not
  * 0xCCCCCC, "recovers" the DSP: sample counter off, GP/EP reset, a 10 ms
- * stall. The model runs no DSP program, so the word has to be answered.
- * Run three ways (see CMakeLists.txt): default, =0, and a moved address. */
+ * stall. GP and EP memory are plain RAM in the aperture, so the word has to
+ * be stored there when the aperture is made. Run three ways (CMakeLists.txt):
+ * default, =0, and a moved address. */
 #include "apu_state.h"
 #include "apu_shim.h"
 
@@ -12,6 +13,8 @@
 void *recomp_lookup(unsigned long address) { (void)address; abort(); }
 void *recomp_lookup_manual(unsigned long address) { (void)address; abort(); }
 
+#define APERTURE (512u << 10)
+
 static int failures;
 
 static void check(int ok, const char *what)
@@ -20,31 +23,41 @@ static void check(int ok, const char *what)
     if (!ok) failures++;
 }
 
+static uint32_t word(const uint8_t *ap, uint32_t off)
+{
+    uint32_t w;
+    memcpy(&w, ap + off, 4);
+    return w;
+}
+
 int main(int argc, char **argv)
 {
-    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
     const char *mode = argc > 1 ? argv[1] : "default";
-    uint64_t at;
+    uint8_t *ap = (uint8_t *)calloc(1, APERTURE);
+    uint32_t at;
+    int stored;
 
-    if (!d) { fprintf(stderr, "out of memory\n"); return 2; }
+    if (!ap) { fprintf(stderr, "out of memory\n"); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    stored = mcpx_apu_seed_dsp_memory(ap, APERTURE);
     if (!strcmp(mode, "off")) {
         check(apu_dsp_alive_offset() < 0, "=0: feature off");
-        check(mcpx_apu_mmio_read(d, 0x5A018, 4) == 0, "=0: word reads 0");
+        check(!stored, "=0: nothing stored");
+        check(word(ap, 0x5A018) == 0, "=0: word stays 0");
     } else {
         at = !strcmp(mode, "addr") ? 0x5B020 : 0x5A018;
         check(apu_dsp_alive_offset() == (int64_t)at, "offset resolved");
-        check(mcpx_apu_mmio_read(d, at, 4) == 0xCCCCCC, "dword reads 0xCCCCCC");
-        check(mcpx_apu_mmio_read(d, at, 2) == 0xCCCC, "word reads 0xCCCC");
-        check(mcpx_apu_mmio_read(d, at + 2, 1) == 0xCC, "byte +2 reads 0xCC");
-        check(mcpx_apu_mmio_read(d, at + 3, 1) == 0, "byte +3 reads 0");
-        check(mcpx_apu_mmio_read(d, at + 4, 4) == 0, "next word reads 0");
-        check(mcpx_apu_mmio_read(d, at - 4, 4) == 0, "previous word reads 0");
+        check(stored, "word stored");
+        check(word(ap, at) == 0xCCCCCC, "word is 0xCCCCCC");
+        check(word(ap, at + 4) == 0 && word(ap, at - 4) == 0,
+              "neighbours untouched");
         if (!strcmp(mode, "addr"))
-            check(mcpx_apu_mmio_read(d, 0x5A018, 4) == 0,
-                  "old address no longer answered");
+            check(word(ap, 0x5A018) == 0, "old address left alone");
     }
+    check(!mcpx_apu_seed_dsp_memory(NULL, APERTURE), "NULL aperture refused");
+    check(!mcpx_apu_seed_dsp_memory(ap, 0x2000), "aperture too small refused");
+
     {   /* a storm warns once and keeps running */
         int i;
         for (i = 0; i < 100; i++)
@@ -52,5 +65,6 @@ int main(int argc, char **argv)
         check(1, "counter-off storm path runs");
     }
     printf("%s\n", failures ? "FAILED" : "all passed");
+    free(ap);
     return failures ? 1 : 0;
 }
