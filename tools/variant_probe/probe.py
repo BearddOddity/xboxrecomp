@@ -52,6 +52,7 @@ CANDIDATES = [
     ("RECOMP_AUDIO_AHEAD_PERIODS", "4"),
 ]
 FLIP_RE = re.compile(r"\((\d+) flips\)")
+FPS_RE = re.compile(r"\[GPU\] ([\d.]+) fps \(\d+ flips\)")
 # Lift gaps a run reveals (what tools/seed_from_log reads): no function at a called address, or a
 # thread start routine with no dispatch entry. A switch cannot fix these; the lift must be re-seeded.
 GAP_RE = re.compile(r"Failed to resolve VA (0x[0-9A-Fa-f]+)|start routine (0x[0-9A-Fa-f]+) not found in dispatch")
@@ -77,6 +78,7 @@ def read_run(d: Path, rc: int, killed: bool) -> dict:
         "ended": (not deadline) and rc == 0,
         "stalled": deadline and stalled(flips),
         "flips": flips[-1] if flips else None,
+        "fps": float(FPS_RE.findall(err)[-1]) if FPS_RE.findall(err) else None,
         "lift_gaps": sorted({a or b for a, b in GAP_RE.findall(err)}),
         "silent": None,
         "clipped": None,
@@ -140,7 +142,7 @@ def combine(ms: list) -> dict:
     if len(ms) == 1:
         return ms[0]
     out: dict = dict(ms[0], repeats=len(ms), exit=sorted(m["exit"] for m in ms)[len(ms) // 2])
-    for k in ("flips", "silent", "clipped"):
+    for k in ("flips", "fps", "silent", "clipped"):
         v = [m[k] for m in ms if m[k] is not None]
         out[k] = statistics.median(v) if v else None
         out[k + "_range"] = [min(v), max(v)] if v else None
@@ -151,26 +153,30 @@ def combine(ms: list) -> dict:
     return out
 
 
-def run_repeats(exe: Path, out: Path, name: str, env_set: dict, a) -> dict:
-    """Run a config a.repeat times (dirs <name>, <name>#2, ...) and combine; --reuse reads them."""
-    ms = []
+def run_all(exe: Path, out: Path, configs: list, a) -> dict:
+    """Run every (name, env) config a.repeat times and combine each. Rounds are interleaved
+    (baseline, switch 1, switch 2, ... then again) so drift on the host hits every config alike:
+    on 50 Cent the same build alternates between about 2250 and about 3150 flips in 40 s, and
+    running a config's repeats back to back made the baseline look better than every switch.
+    Run dirs are <name>, <name>#2, ...; --reuse re-reads them."""
+    ms = {name: [] for name, _ in configs}
     for i in range(1, a.repeat + 1):
-        n = name if i == 1 else f"{name}#{i}"
-        if a.reuse:
-            d = out / "runs" / n
-            m = read_run(d, json.loads((d / "metrics.json").read_text())["exit"], False)
-            (d / "metrics.json").write_text(json.dumps(m, indent=2))
-        else:
-            m = run_one(exe, out, n, env_set, a.seconds, a.grace)
-            print(f"  {n}: exit {m['exit']} flips {m['flips']} frames {m['frames']}", flush=True)
-        ms.append(m)
-    return combine(ms)
+        for name, env_set in configs:
+            n = name if i == 1 else f"{name}#{i}"
+            if a.reuse:
+                d = out / "runs" / n
+                m = read_run(d, json.loads((d / "metrics.json").read_text())["exit"], False)
+                (d / "metrics.json").write_text(json.dumps(m, indent=2))
+            else:
+                m = run_one(exe, out, n, env_set, a.seconds, a.grace)
+                print(f"  {n}: exit {m['exit']} flips {m['flips']} frames {m['frames']}", flush=True)
+            ms[name].append(m)
+    return {name: combine(v) for name, v in ms.items()}
 
 
-def beyond(b: dict, s: dict, k: str, up: bool) -> bool:
-    """True when s's median is outside the baseline's repeat range (always true without repeats)."""
-    r = b.get(k + "_range")
-    return True if not r else (s[k] > r[1] if up else s[k] < r[0])
+def paced(fps: float) -> bool:
+    """Within 55-65 fps: the 60 Hz vblank schedule. Unpaced runs on 50 Cent reached ~89 fps."""
+    return 55 <= fps <= 65
 
 
 def fails(m: dict, audio_expected: bool) -> bool:
@@ -189,17 +195,15 @@ def classify(b: dict, s: dict, audio_expected: bool):
     if sf:
         return "harmful", f"run fails ({fail_word(s)}), baseline passes"
     harm, help_ = [], []
-    if s["flips"] is not None:
-        if b["flips"] is None:
-            if s["flips"] > 0:
-                help_.append(f"frames appear ({s['flips']} flips)")
-        elif b["flips"] > 0:
-            # A change counts when it is 20%+ and, with repeats, outside the baseline's own spread.
-            rel = (s["flips"] - b["flips"]) / b["flips"]
-            if rel >= 0.2 and beyond(b, s, "flips", True):
-                help_.append(f"flips {b['flips']:.0f} -> {s['flips']:.0f}")
-            elif rel <= -0.2 and beyond(b, s, "flips", False):
-                harm.append(f"flips {b['flips']:.0f} -> {s['flips']:.0f}")
+    # Flips only say the title is alive: more flips is not better (an unpaced run races, and a
+    # paced one drops from ~89 to ~59 fps, which is right). Pacing near 60 fps is the quality signal.
+    if s["flips"] is not None and b["flips"] is None and s["flips"] > 0:
+        help_.append(f"frames appear ({s['flips']:.0f} flips)")
+    if b.get("fps") is not None and s.get("fps") is not None:
+        if not paced(b["fps"]) and paced(s["fps"]):
+            help_.append(f"paced to 60 Hz: {b['fps']:.0f} -> {s['fps']:.0f} fps")
+        elif paced(b["fps"]) and not paced(s["fps"]):
+            harm.append(f"pacing lost: {b['fps']:.0f} -> {s['fps']:.0f} fps")
     if b["silent"] is not None and s["silent"] is not None:
         d = s["silent"] - b["silent"]
         if d <= -0.10:
@@ -234,7 +238,7 @@ def parse_base(text: str) -> dict:
 
 
 def selftest():
-    ok = {"crashed": False, "ended": False, "stalled": False, "flips": 60, "silent": 0.5,
+    ok = {"crashed": False, "ended": False, "stalled": False, "flips": 60, "fps": None, "silent": 0.5,
           "clipped": 0.0, "frames": 1000, "exit": 3, "deadline": True}
     bad = dict(ok, crashed=True, exit=-1073741819, deadline=False, flips=None, silent=None, frames=0)
     stall = dict(ok, stalled=True, flips=0)
@@ -242,7 +246,9 @@ def selftest():
     assert classify(ok, bad, True)[0] == "harmful"
     assert classify(stall, ok, True)[0] == "needed"
     assert classify(bad, bad, True)[0] == "no_effect"
-    assert classify(ok, dict(ok, flips=80), True)[0] == "helpful"
+    assert classify(ok, dict(ok, flips=80), True)[0] == "no_effect"  # more flips is not better
+    assert classify(dict(ok, fps=89.0), dict(ok, fps=59.0), True)[0] == "helpful"  # paced to 60 Hz
+    assert classify(dict(ok, fps=59.0), dict(ok, fps=89.0), True)[0] == "harmful"
     assert classify(ok, dict(ok, silent=0.9), True)[0] == "harmful"
     assert classify(ok, dict(ok), True)[0] == "no_effect"
     assert classify(dict(ok, flips=None), dict(ok, flips=12), True)[0] == "helpful"
@@ -251,13 +257,13 @@ def selftest():
     assert stalled([100, 100, 100, 100]) is True
     assert stalled([10, 20, 30, 40]) is False
     assert stalled([5]) is False
-    # repeats: median + majority, and a gain inside the baseline's own spread is no effect
+    # repeats: median and range of the numbers, majority of the flags
     r = lambda f, **kw: dict(ok, flips=f, **kw)
     base3 = combine([r(2172), r(1961), r(2206)])
     assert base3["flips"] == 2172 and base3["flips_range"] == [1961, 2206]
-    assert classify(base3, combine([r(2300), r(2250), r(2400)]), True)[0] == "no_effect"  # +6%, in noise
-    assert classify(base3, combine([r(2900), r(2800), r(2950)]), True)[0] == "helpful"
     assert combine([r(1, stalled=True), r(1, stalled=True), r(1)])["stalled"] is True
+    assert combine([r(1, stalled=True), r(1), r(1)])["stalled"] is False
+    assert paced(59.0) and not paced(89.0)
     print("selftest ok")
 
 
@@ -286,13 +292,11 @@ def main():
     if not a.reuse:
         print(f"baseline + {len(cands)} switches, {a.seconds}s x {a.repeat} each -> {out}", flush=True)
     # --reuse re-parses each saved run's output rather than trusting its stored metrics.json.
-    runs = {"baseline": run_repeats(exe, out, "baseline", base, a)}
-    for k, v in cands:
-        runs[k] = run_repeats(exe, out, k, dict(base, **{k: v}), a)
+    runs = run_all(exe, out, [("baseline", base)] + [(k, dict(base, **{k: v})) for k, v in cands], a)
 
     audio_expected = any(r["frames"] > 0 for r in runs.values())
     b = runs["baseline"]
-    switches, opt_ins = {}, {}
+    switches, opt_ins, avoid = {}, {}, {}
     for k, v in cands:
         cls, why = classify(b, runs[k], audio_expected)
         # A numeric call (helpful/harmful on flips or silence) from one run is inside run-to-run noise.
@@ -302,7 +306,9 @@ def main():
         if cls in ("needed", "helpful"):
             opt_ins[k] = v
         elif cls == "harmful":
-            opt_ins[k] = "off"
+            # Harmful on this base, not everywhere: TITLE_KEVENTS stalls alone but works once VBLANK
+            # is on. So it is listed, never written as "off" for the gate.
+            avoid[k] = why
     result = {
         "probe_version": 1,
         "exe": str(exe),
@@ -312,6 +318,7 @@ def main():
         "baseline": {"metrics": b, "fails": fails(b, audio_expected), "run": "runs/baseline"},
         "switches": switches,
         "opt_ins": opt_ins,
+        "avoid_on_this_base": avoid,
         # Not switch results: addresses the lift missed. Seed them before trusting any class above.
         "lift_gaps": sorted({g for r in runs.values() for g in r.get("lift_gaps", [])}),
         "lift_gap_log": "runs/baseline/stderr.txt",
