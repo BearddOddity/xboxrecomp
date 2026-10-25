@@ -219,41 +219,6 @@ int mcpx_apu_seed_dsp_memory(void *aperture, size_t size)
     return 1;
 }
 
-/* Safety net for a title whose "DSP alive" check this model does not
- * satisfy (another address, another value): a title does not switch the
- * sample counter off tens of times a second on purpose. Say so once, with
- * the way out, instead of leaving it to be found as crackle. */
-#define COUNTER_OFF_STORM  20       /* switch-offs ... */
-#define COUNTER_OFF_WINDOW 2000     /* ... within this many ms */
-
-void apu_note_counter_off(int64_t now_ms)
-{
-    static int64_t window_start;
-    static int count, warned;
-
-    if (warned)
-        return;
-    if (now_ms - window_start > COUNTER_OFF_WINDOW) {
-        window_start = now_ms;
-        count = 0;
-    }
-    if (++count < COUNTER_OFF_STORM)
-        return;
-    warned = 1;
-    fprintf(stderr, "[APU] SECTL sample counter switched off %d times in %d ms:"
-                    " the title is probably \"recovering\" a DSP it thinks is"
-                    " dead on every DirectSoundDoWork, which silences periods"
-                    " (crackle). ", count, COUNTER_OFF_WINDOW);
-    if (apu_dsp_alive_offset() < 0)
-        fprintf(stderr, "The alive word is not answered"
-                        " (RECOMP_APU_DSP_ALIVE=0); unset it.");
-    else
-        fprintf(stderr, "The alive word is read as 0x%06X at EP+0x%llX;"
-                        " RECOMP_APU_DSP_ALIVE=<hex address> names another one.",
-                APU_DSP_ALIVE_WORD, (unsigned long long)apu_dsp_alive_offset());
-    fprintf(stderr, " RECOMP_APU_TRACE=1 shows the register writes.\n");
-}
-
 /* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
 static int apu_mmio_trace(void)
 {
@@ -527,9 +492,6 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-            if (addr == NV_PAPU_SECTL &&
-                (sectl & NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF)
-                apu_note_counter_off(qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
             bool running =
                 ((sectl & NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF)
                 && ((fectl & NV_PAPU_FECTL_FEMETHMODE)

@@ -58,12 +58,6 @@ int main(int argc, char **argv)
     check(!mcpx_apu_seed_dsp_memory(NULL, APERTURE), "NULL aperture refused");
     check(!mcpx_apu_seed_dsp_memory(ap, 0x2000), "aperture too small refused");
 
-    {   /* a storm warns once and keeps running */
-        int i;
-        for (i = 0; i < 100; i++)
-            apu_note_counter_off(1000 + i);
-        check(1, "counter-off storm path runs");
-    }
     printf("%s\n", failures ? "FAILED" : "all passed");
     free(ap);
     return failures ? 1 : 0;

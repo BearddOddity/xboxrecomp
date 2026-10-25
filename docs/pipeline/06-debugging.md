@@ -362,10 +362,11 @@ where it is not.
 | Periods of digital silence, a 10 ms stall about 66 times a second, `SECTL` toggling in the trace | DirectSound's `DirectSoundDoWork` reads the encode DSP's "alive" word (EP memory `0xFE85A018`) and, finding anything but `0xCCCCCC`, resets the DSP. No DSP program runs here, so it read 0. True Crime: NYC and Hulk: Ultimate Destruction both hit it. | the word is stored as `0xCCCCCC` when the MCPX aperture is created (GP/EP memory is plain RAM) | `RECOMP_APU_DSP_ALIVE=0` leaves it 0; `=<hex>` names another address (EP offset or absolute `0xFE8xxxxx`) for an XDK that keeps the word elsewhere |
 | Crackle in borderless fullscreen only, clean windowed; no underruns reported | Each `Present` waits for vblank, the 43 ms device queue reaches its low mark, and the pacer renders ahead in a burst that carries a voice's play cursor past the title's own stream writes | 6 XAudio2 buffers (64 ms) | `RECOMP_AUDIO_BUF_COUNT=<2..8>` sets the depth; `RECOMP_AUDIO_AHEAD_PERIODS=<n>` caps the render-ahead at n 256-sample periods |
 
-If the sample counter is switched off 20 times within 2 seconds the APU
-prints one `[APU] SECTL sample counter switched off ...` line naming the
-switch above. A title does not do that on purpose; it is a DSP check this
-model does not yet answer. `RECOMP_APU_TRACE=1` shows the register writes.
+`SECTL` toggling alone does not mean a recovery: DirectSound also pauses and
+resumes the engine (`SECTL` 7, then 0xF) in its interrupt handler, many times
+a second on a healthy title. A recovery is told apart by the stall it adds
+to the calling thread and, in a title that has one, by the guest's own
+recovery counter.
 
 To tell a fix is working, record with `RECOMP_AUDIO_WAV` and count the runs
 of exact-zero samples with loud audio on both sides: that is the silenced
