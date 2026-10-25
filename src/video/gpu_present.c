@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_present.h"
+#include "present_vsync.h"
 
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
@@ -99,10 +100,9 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     D3D11_SAMPLER_DESC smp;
     ID3DBlob *vsb, *psb;
     HRESULT hr;
-    const char *v = getenv("RECOMP_PRESENT_VSYNC"), *f = getenv("RECOMP_PRESENT_FILTER");
+    const char *f = getenv("RECOMP_PRESENT_FILTER");
 
-    if (v && v[0] == '0')
-        s_vsync = 0;
+    s_vsync = present_vsync_on();
     s_hwnd = hwnd;
     s_w = width; s_h = height;
     client_size(&s_bw, &s_bh);

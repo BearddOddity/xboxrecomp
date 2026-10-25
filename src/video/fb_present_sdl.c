@@ -45,6 +45,7 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "present_vsync.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -286,8 +287,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (!env_on("RECOMP_FB_WINDOW") || env_on("RECOMP_HEADLESS"))
         return guest_main();
 
-    e = getenv("RECOMP_PRESENT_VSYNC");
-    vsync = !e || env_on("RECOMP_PRESENT_VSYNC");
+    vsync = present_vsync_on();
     e = getenv("RECOMP_WINDOW_SCALE");
     scale = e ? atoi(e) : 2;
     if (scale < 1 || scale > 8)
