@@ -434,9 +434,13 @@ a second on a healthy title. A recovery is told apart by the silent frames
 it causes: watch `frames: ... silent ... (sample counter off <n>)` under
 `RECOMP_APU_MIXSTAT`, which stays at 0 on a healthy title.
 
-To tell a fix is working, record with `RECOMP_AUDIO_WAV` and count the runs
-of exact-zero samples with loud audio on both sides: that is the silenced
-periods. Then see the diagnostics below for the host side.
+To tell a fix is working, record with `RECOMP_AUDIO_WAV` and score the file
+with `py -3 tools/audio/wav_analyze.py dump.wav` (needs numpy): it counts
+clipped samples, peak and RMS, runs of exact-zero samples (2 ms or longer;
+with loud audio on both sides these are the silenced periods) and clicks, and
+lists the worst windows so they can be matched to game time. Hulk: Ultimate
+Destruction went from 2,739 zero runs a minute to 12 with it. Then see the
+diagnostics below for the host side.
 
 ## Audio Diagnostics
 
